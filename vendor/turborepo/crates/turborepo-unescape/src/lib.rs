@@ -1,0 +1,129 @@
+//! Marker type for biome parsed JSON strings which are not escaped
+//! See https://github.com/biomejs/biome/issues/1596 for more information
+
+use std::{
+    fmt::{self, Display},
+    ops::{Deref, DerefMut},
+};
+
+use biome_deserialize::{Deserializable, DeserializableValue, DeserializationDiagnostic};
+use schemars::{JsonSchema, r#gen::SchemaGenerator, schema::Schema};
+use ts_rs::TS;
+
+// We're using a newtype here because biome currently doesn't
+// handle escapes and we can't override the String deserializer
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct UnescapedString(String);
+
+impl Display for UnescapedString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for UnescapedString {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for UnescapedString {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for UnescapedString {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+fn unescape_str(s: String) -> Result<String, serde_json::Error> {
+    let wrapped_s = format!("\"{s}\"");
+
+    serde_json::from_str(&wrapped_s)
+}
+
+impl Deserializable for UnescapedString {
+    fn deserialize(
+        value: &impl DeserializableValue,
+        name: &str,
+        diagnostics: &mut Vec<DeserializationDiagnostic>,
+    ) -> Option<Self> {
+        let str = String::deserialize(value, name, diagnostics)?;
+
+        match unescape_str(str) {
+            Ok(s) => Some(Self(s)),
+            Err(e) => {
+                diagnostics.push(DeserializationDiagnostic::new(format!("{e}")));
+                None
+            }
+        }
+    }
+}
+
+impl From<UnescapedString> for String {
+    fn from(value: UnescapedString) -> Self {
+        value.0
+    }
+}
+
+impl From<String> for UnescapedString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+// For testing purposes
+impl From<&'static str> for UnescapedString {
+    fn from(value: &'static str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+/// `UnescapedString` is transparent for JSON Schema - it generates a string
+/// schema. This is because it's marked `#[serde(transparent)]` and is just a
+/// newtype wrapper around `String`.
+impl JsonSchema for UnescapedString {
+    fn schema_name() -> String {
+        "String".to_string()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
+    }
+}
+
+/// `UnescapedString` is transparent for TypeScript - it generates a `string`
+/// type.
+impl TS for UnescapedString {
+    type WithoutGenerics = Self;
+    type OptionInnerType = Self;
+
+    fn name() -> String {
+        "string".to_string()
+    }
+
+    fn inline() -> String {
+        "string".to_string()
+    }
+
+    fn inline_flattened() -> String {
+        "string".to_string()
+    }
+
+    fn decl() -> String {
+        String::new()
+    }
+
+    fn decl_concrete() -> String {
+        String::new()
+    }
+
+    fn dependencies() -> Vec<ts_rs::Dependency> {
+        vec![]
+    }
+}

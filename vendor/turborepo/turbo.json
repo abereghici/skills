@@ -1,0 +1,87 @@
+{
+  "$schema": "https://turborepo.dev/schema.json",
+  "ui": "tui",
+  "noUpdateNotifier": true,
+  // The following are used by tools such as pnpm, gh actions to setup pnpm, etc.
+  "globalPassThroughEnv": [
+    "Path",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TMPDIR",
+    "HOME",
+    "TMP",
+    "USERPROFILE",
+    "SCCACHE_GHA_ENABLED",
+    "SCCACHE_BUCKET",
+    "SCCACHE_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "RUSTC_WRAPPER",
+    "CARGO_INCREMENTAL",
+    "CARGO_BUILD_JOBS",
+    "RUSTFLAGS",
+    "ACTIONS_CACHE_URL",
+    "ACTIONS_RUNTIME_TOKEN"
+  ],
+  // This is probably overkill, but we do things per-platform often enough that we should segment
+  // everything by OS and RUNNER_OS. This will segment between GH actions and everything else for now.
+  "globalEnv": ["OS", "RUNNER_OS"],
+  "tasks": {
+    "test": {
+      "outputs": ["coverage/**/*"],
+      "env": ["NODE_VERSION"],
+      // ^build is generically set here, we haven't fully enumerated which workspaces
+      // actually need to build before running tests.
+      "dependsOn": ["^build"]
+    },
+
+    // docs lint task runs fumadocs-mdx to generate types before oxlint
+    "docs#lint": {},
+    "//#quality": {
+      "dependsOn": ["//#lint", "//#format", "//#check:toml", "docs#lint"]
+    },
+    "//#lint": {
+      "inputs": ["!pnpm-lock.yaml"]
+    },
+    "//#lint:fix": {},
+    "//#format": {},
+    "//#format:fix": {},
+    "//#check:toml": {},
+    "//#fix:toml": {},
+    "//#quality:fix": {
+      "dependsOn": ["//#lint:fix", "//#format:fix", "//#fix:toml"]
+    },
+    "check-types": {
+      "dependsOn": ["^build"]
+    },
+    "check-openapi": {},
+    "//#build:ts": {
+      "outputs": ["packages/**/dist"]
+    },
+    "build:ts": {
+      "outputs": ["dist/**/*"]
+    },
+    "build": {
+      "outputs": [
+        "dist/**/*",
+        ".next/**/*",
+        "!.next/cache/**/*",
+        "!.next/dev/**/*",
+        "!README.md"
+      ],
+      "dependsOn": ["^build"]
+    },
+    "build:test-archive": {},
+    "package-checks": {
+      "dependsOn": ["package:types"]
+    },
+    "package:types": {},
+    // This is a synthetic tasks that lets us pull in other workspaces as dependencies
+    // So changes in internal workspaces that we depend on, will trigger this task.
+    "topo": {
+      "dependsOn": ["^topo"]
+    },
+    "check-examples": {},
+    "check-lockfiles": {}
+  }
+}

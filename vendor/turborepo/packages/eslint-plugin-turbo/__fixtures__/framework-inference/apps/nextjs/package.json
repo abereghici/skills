@@ -1,0 +1,10 @@
+{
+  "name": "nextjs",
+  "dependencies": {
+    "next": "16.1.5"
+  },
+  "devDependencies": {
+    "eslint": "8.57.0",
+    "eslint-plugin-turbo": "../../../../"
+  }
+}

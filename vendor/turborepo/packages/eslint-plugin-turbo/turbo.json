@@ -1,0 +1,10 @@
+{
+  "$schema": "../../docs/public/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "test": {
+      "dependsOn": ["build"],
+      "passThroughEnv": ["!CI"]
+    }
+  }
+}

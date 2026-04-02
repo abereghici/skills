@@ -1,0 +1,803 @@
+use std::collections::BTreeMap;
+
+use biome_deserialize_macros::Deserializable;
+use biome_json_parser::JsonParserOptions;
+use serde::Serialize;
+
+use crate::{
+    DevelopmentTask, Error,
+    port::{generate_port_from_name, parse_port_from_host},
+};
+
+pub enum ParseResult {
+    Actual(ConfigV1),
+    Reference(String),
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+pub struct ConfigV1 {
+    #[serde(rename = "$schema", skip)]
+    schema: Option<String>,
+    version: Option<String>,
+    applications: BTreeMap<String, Application>,
+    options: Option<Options>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+struct Options {
+    local_proxy_port: Option<u16>,
+    disable_overrides: Option<bool>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+struct ChildConfig {
+    part_of: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+struct Application {
+    package_name: Option<String>,
+    development: Option<Development>,
+    routing: Option<Vec<PathGroup>>,
+    asset_prefix: Option<String>,
+    production: Option<ProductionConfig>,
+    vercel: Option<VercelConfig>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+pub struct PathGroup {
+    pub paths: Vec<String>,
+    pub group: Option<String>,
+    pub flag: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+struct ProductionConfig {
+    protocol: Option<String>,
+    host: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+struct VercelConfig {
+    #[serde(rename = "projectId")]
+    project_id: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserializable, Default, Clone)]
+struct Development {
+    task: Option<String>,
+    local: Option<LocalHost>,
+    fallback: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Default, Clone, Copy)]
+struct LocalHost {
+    port: Option<u16>,
+}
+
+impl biome_deserialize::Deserializable for LocalHost {
+    fn deserialize(
+        value: &impl biome_deserialize::DeserializableValue,
+        name: &str,
+        diagnostics: &mut Vec<biome_deserialize::DeserializationDiagnostic>,
+    ) -> Option<Self> {
+        use biome_deserialize::VisitableType;
+
+        // Check what type we have
+        match value.visitable_type()? {
+            // Deserialize as a plain number (just the port)
+            VisitableType::NUMBER => {
+                let port_num = u16::deserialize(value, name, diagnostics)?;
+                Some(LocalHost {
+                    port: Some(port_num),
+                })
+            }
+            // Deserialize as a string (host with optional port)
+            VisitableType::STR => {
+                let host_str = String::deserialize(value, name, diagnostics)?;
+                let port = parse_port_from_host(&host_str);
+                Some(LocalHost { port })
+            }
+            // Deserialize as an object (with explicit port field)
+            VisitableType::MAP => {
+                #[derive(Deserializable, Default)]
+                struct LocalHostObject {
+                    port: Option<u16>,
+                }
+                let obj = LocalHostObject::deserialize(value, name, diagnostics)?;
+                Some(LocalHost { port: obj.port })
+            }
+            _ => {
+                diagnostics.push(
+                    biome_deserialize::DeserializationDiagnostic::new(format!(
+                        "Expected a number, string, or object for '{name}'"
+                    ))
+                    .with_range(value.range()),
+                );
+                None
+            }
+        }
+    }
+}
+
+impl ConfigV1 {
+    pub fn from_str(input: &str, source: &str) -> Result<ParseResult, Error> {
+        let jsonc_options = JsonParserOptions::default()
+            .with_allow_comments()
+            .with_allow_trailing_commas();
+
+        // attempt to parse a child, ignoring any errors
+        let (config, errs) = biome_deserialize::json::deserialize_from_json_str::<ChildConfig>(
+            input,
+            jsonc_options,
+            source,
+        )
+        .consume();
+
+        if let Some(ChildConfig { part_of }) = errs.is_empty().then_some(config).flatten() {
+            return Ok(ParseResult::Reference(part_of));
+        }
+        // attempt to parse a real one
+        let (config, errs) = biome_deserialize::json::deserialize_from_json_str::<ConfigV1>(
+            input,
+            jsonc_options,
+            source,
+        )
+        .consume();
+
+        if let Some(config) = config {
+            // Only accept the config if there were no errors during parsing
+            if !errs.is_empty() {
+                return Err(Error::biome_error(errs));
+            }
+            // Accept any version. This allows the Turborepo proxy to work with
+            // configurations that have different version numbers than expected,
+            // as long as the structure is compatible with what Turborepo needs
+            // to route traffic.
+            Ok(ParseResult::Actual(config))
+        } else {
+            Err(Error::biome_error(errs))
+        }
+    }
+
+    /// Converts a TurborepoConfig to ConfigV1 for compatibility with
+    /// the proxy. This preserves only the fields that TurborepoConfig knows
+    /// about, discarding any Vercel-specific metadata.
+    pub fn from_turborepo_config(config: &crate::schema::TurborepoConfig) -> Self {
+        let mut applications = BTreeMap::new();
+
+        for (app_name, turbo_app) in config.applications() {
+            let app = Application {
+                package_name: turbo_app.package_name.clone(),
+                development: turbo_app.development.as_ref().map(|dev| Development {
+                    task: None,
+                    local: dev.local.map(|lh| LocalHost { port: lh.port }),
+                    fallback: dev.fallback.clone(),
+                }),
+                routing: turbo_app.routing.as_ref().map(|routes| {
+                    routes
+                        .iter()
+                        .map(|r| PathGroup {
+                            paths: r.paths.clone(),
+                            group: r.group.clone(),
+                            flag: None,
+                        })
+                        .collect()
+                }),
+                asset_prefix: None,
+                production: None,
+                vercel: None,
+            };
+            applications.insert(app_name, app);
+        }
+
+        ConfigV1 {
+            version: None,
+            applications,
+            options: config.local_proxy_port().map(|port| Options {
+                local_proxy_port: Some(port),
+                disable_overrides: None,
+            }),
+            schema: None,
+        }
+    }
+
+    pub fn development_tasks(&self) -> impl Iterator<Item = DevelopmentTask<'_>> {
+        self.applications
+            .iter()
+            .map(|(application, config)| DevelopmentTask {
+                application_name: application,
+                package: config.package_name(application),
+                task: config.task(),
+            })
+    }
+
+    pub fn applications(&self) -> impl Iterator<Item = crate::Application<'_>> {
+        self.applications
+            .iter()
+            .map(|(application, config)| crate::Application {
+                application_name: application,
+                package: config.package_name(application),
+            })
+    }
+
+    /// Resolves an application by name. Tries a direct key match first,
+    /// then falls back to scanning by `packageName`. This handles the common
+    /// case where the config key (e.g. a Vercel project name) differs from
+    /// the local package name.
+    fn find_application(&self, name: &str) -> Option<(&String, &Application)> {
+        self.applications.get_key_value(name).or_else(|| {
+            self.applications
+                .iter()
+                .find(|(key, app)| app.package_name(key) == name)
+        })
+    }
+
+    /// Returns the dev server port for the given application.
+    ///
+    /// Looks up `name` first as a config map key, then falls back to
+    /// scanning by `packageName`. When no explicit port is configured,
+    /// a deterministic port is generated from the config map key.
+    pub fn port(&self, name: &str) -> Option<u16> {
+        let (key, app) = self.find_application(name)?;
+        Some(app.port(key))
+    }
+
+    pub fn local_proxy_port(&self) -> Option<u16> {
+        self.options.as_ref()?.local_proxy_port
+    }
+
+    /// Returns the routing configuration for the given application.
+    ///
+    /// Looks up `name` first as a config map key, then falls back to
+    /// scanning by `packageName`.
+    pub fn routing(&self, app_name: &str) -> Option<&[PathGroup]> {
+        let (_, app) = self.find_application(app_name)?;
+        app.routing.as_deref()
+    }
+
+    /// Returns the fallback URL for the given application.
+    ///
+    /// Looks up `name` first as a config map key, then falls back to
+    /// scanning by `packageName`.
+    pub fn fallback(&self, name: &str) -> Option<&str> {
+        let (_, app) = self.find_application(name)?;
+        app.fallback()
+    }
+
+    /// Returns the name and package of the application that serves the root
+    /// route. The root route app is the first one without explicit routing
+    /// configuration.
+    pub fn root_route_app(&self) -> Option<(&str, &str)> {
+        self.applications
+            .iter()
+            .find(|(_, app)| app.routing.is_none())
+            .map(|(app_name, app)| (app_name.as_str(), app.package_name(app_name)))
+    }
+}
+
+impl Application {
+    fn task(&self) -> Option<&str> {
+        self.development.as_ref()?.task.as_deref()
+    }
+
+    fn user_port(&self) -> Option<u16> {
+        self.development.as_ref()?.local.as_ref()?.port
+    }
+
+    fn port(&self, name: &str) -> u16 {
+        self.user_port()
+            .unwrap_or_else(|| generate_port_from_name(name))
+    }
+
+    fn package_name<'a>(&'a self, key: &'a str) -> &'a str {
+        self.package_name.as_deref().unwrap_or(key)
+    }
+
+    fn fallback(&self) -> Option<&str> {
+        self.development.as_ref()?.fallback.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::port::{MAX_PORT, MIN_PORT};
+
+    #[test]
+    fn test_child_config_parse() {
+        let input = r#"{"partOf": "web"}"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(_config_v2) => panic!("expected to get reference to default app"),
+            ParseResult::Reference(default_app) => {
+                assert_eq!(default_app, "web");
+            }
+        }
+    }
+
+    #[test]
+    fn test_root_config_parse() {
+        let input = r#"{
+        "version": "1",
+        "applications": {
+          "web": {},
+          "docs": {"development": {"task": "serve"}}
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.applications.get("web").unwrap().task(), None);
+                assert_eq!(
+                    config_v1.applications.get("docs").unwrap().task(),
+                    Some("serve")
+                );
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_no_version_config_parse() {
+        let input = r#"{
+        "applications": {
+          "web": {},
+          "docs": {"development": {"task": "serve"}}
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.applications.get("web").unwrap().task(), None);
+                assert_eq!(
+                    config_v1.applications.get("docs").unwrap().task(),
+                    Some("serve")
+                );
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_package_name_parse() {
+        let input = r#"{
+        "applications": {
+          "web": {
+            "packageName": "@acme/web"
+          },
+          "docs": {"development": {"task": "serve"}}
+        }
+    }"#;
+
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(
+                    config_v1.applications.get("web").unwrap().package_name,
+                    Some("@acme/web".into())
+                );
+                assert_eq!(
+                    config_v1.applications.get("docs").unwrap().package_name,
+                    None
+                );
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_package_name_development_tasks() {
+        let input = r#"{
+        "applications": {
+          "web": {
+            "packageName": "@acme/web"
+          },
+          "docs": {"development": {"task": "serve"}}
+        }
+    }"#;
+
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                let mut dev_tasks = config_v1.development_tasks().collect::<Vec<_>>();
+                dev_tasks.sort();
+                assert_eq!(
+                    dev_tasks,
+                    vec![
+                        DevelopmentTask {
+                            application_name: "docs",
+                            package: "docs",
+                            task: Some("serve")
+                        },
+                        DevelopmentTask {
+                            application_name: "web",
+                            package: "@acme/web",
+                            task: None
+                        },
+                    ]
+                );
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_port_lookup_by_package_name() {
+        let input = r#"{
+        "applications": {
+            "my-vercel-project": {
+                "packageName": "my-app",
+                "development": {"local": 3001}
+            }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("my-app"), Some(3001));
+                assert_eq!(config_v1.port("my-vercel-project"), Some(3001));
+            }
+            ParseResult::Reference(_) => panic!("expected main config"),
+        }
+    }
+
+    #[test]
+    fn test_port_lookup_by_package_name_auto_generated() {
+        let input = r#"{
+        "applications": {
+            "my-vercel-project": {
+                "packageName": "my-app"
+            }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                let port_by_pkg = config_v1.port("my-app");
+                let port_by_key = config_v1.port("my-vercel-project");
+                assert!(port_by_pkg.is_some());
+                assert!(port_by_key.is_some());
+                assert_eq!(port_by_pkg, port_by_key);
+                assert_eq!(
+                    port_by_key,
+                    Some(generate_port_from_name("my-vercel-project"))
+                );
+            }
+            ParseResult::Reference(_) => panic!("expected main config"),
+        }
+    }
+
+    #[test]
+    fn test_port_returns_none_for_unknown_name() {
+        let input = r#"{"applications": {"web": {"development": {"local": 3000}}}}"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("nonexistent"), None);
+            }
+            ParseResult::Reference(_) => panic!("expected main config"),
+        }
+    }
+
+    #[test]
+    fn test_direct_key_takes_priority_over_package_name() {
+        let input = r#"{
+        "applications": {
+            "web": {
+                "development": {"local": 3000}
+            },
+            "vercel-web": {
+                "packageName": "web",
+                "development": {"local": 4000}
+            }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("web"), Some(3000));
+                assert_eq!(config_v1.port("vercel-web"), Some(4000));
+            }
+            ParseResult::Reference(_) => panic!("expected main config"),
+        }
+    }
+
+    #[test]
+    fn test_fallback_lookup_by_package_name() {
+        let input = r#"{
+        "applications": {
+            "my-vercel-project": {
+                "packageName": "my-app",
+                "development": {
+                    "local": 3001,
+                    "fallback": "example.com"
+                }
+            }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.fallback("my-app"), Some("example.com"));
+                assert_eq!(config_v1.fallback("my-vercel-project"), Some("example.com"));
+            }
+            ParseResult::Reference(_) => panic!("expected main config"),
+        }
+    }
+
+    #[test]
+    fn test_routing_lookup_by_package_name() {
+        let input = r#"{
+        "applications": {
+            "my-vercel-project": {
+                "packageName": "my-app",
+                "routing": [{"paths": ["/docs"], "group": "docs"}],
+                "development": {"local": 3001}
+            }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert!(config_v1.routing("my-app").is_some());
+                assert!(config_v1.routing("my-vercel-project").is_some());
+            }
+            ParseResult::Reference(_) => panic!("expected main config"),
+        }
+    }
+
+    #[test]
+    fn test_generate_port() {
+        assert_eq!(generate_port_from_name("test-450"), 7724);
+    }
+
+    #[test]
+    fn test_local_port_plain_number() {
+        let input = r#"{
+        "version": "1",
+        "applications": {
+          "web": {
+            "development": {
+              "local": 3000
+            }
+          }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("web"), Some(3000));
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_local_port_string_with_port() {
+        let input = r#"{
+        "version": "1",
+        "applications": {
+          "web": {
+            "development": {
+              "local": "localhost:3002"
+            }
+          }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("web"), Some(3002));
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_local_port_string_with_protocol() {
+        let input = r#"{
+        "version": "1",
+        "applications": {
+          "web": {
+            "development": {
+              "local": "http://localhost:3003"
+            }
+          }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("web"), Some(3003));
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_local_port_string_without_port() {
+        let input = r#"{
+        "version": "1",
+        "applications": {
+          "web": {
+            "development": {
+              "local": "localhost"
+            }
+          }
+        }
+    }"#;
+        let config = ConfigV1::from_str(input, "somewhere").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                // Should fall back to generated port
+                assert!(config_v1.port("web").is_some());
+                let port = config_v1.port("web").unwrap();
+                assert!((MIN_PORT..MAX_PORT).contains(&port));
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_user_config_format() {
+        // Test the exact format from the user's issue
+        let input = r#"{
+        "$schema": "https://openapi.vercel.sh/microfrontends.json",
+        "applications": {
+          "microfrontends-marketing": {
+            "development": {
+              "local": 3000,
+              "fallback": "microfrontends-marketing.labs.vercel.dev"
+            }
+          },
+          "microfrontends-docs": {
+            "development": {
+              "local": 3001
+            },
+            "routing": [
+              {
+                "group": "docs",
+                "paths": ["/docs", "/docs/:path*"]
+              }
+            ]
+          }
+        }
+      }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                // Verify the ports are correctly parsed
+                assert_eq!(config_v1.port("microfrontends-marketing"), Some(3000));
+                assert_eq!(config_v1.port("microfrontends-docs"), Some(3001));
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_fallback_parsing() {
+        let input = r#"{
+        "applications": {
+          "web": {
+            "development": {
+              "local": 3000,
+              "fallback": "example.com"
+            }
+          },
+          "docs": {
+            "development": {
+              "local": 3001,
+              "fallback": "https://docs.example.com"
+            }
+          },
+          "api": {
+            "development": {
+              "local": 3002
+            }
+          }
+        }
+      }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json").unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.fallback("web"), Some("example.com"));
+                assert_eq!(config_v1.fallback("docs"), Some("https://docs.example.com"));
+                assert_eq!(config_v1.fallback("api"), None);
+                assert_eq!(config_v1.fallback("nonexistent"), None);
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_json_unclosed_bracket() {
+        let input = r#"{"applications": {"web": {"development": {"local": 3000}}"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json");
+        assert!(
+            config.is_err(),
+            "Parser should reject JSON with unclosed bracket"
+        );
+    }
+
+    #[test]
+    fn test_jsonc_trailing_commas_accepted() {
+        let input = r#"{"applications": {"web": {"development": {"local": 3000,}}}}"#;
+        let config = ConfigV1::from_str(input, "microfrontends.jsonc");
+        assert!(
+            config.is_ok(),
+            "Parser should accept JSONC with trailing commas"
+        );
+    }
+
+    #[test]
+    fn test_jsonc_trailing_commas_fixture() {
+        let input = include_str!("../fixtures/trailing-commas.jsonc");
+        let config = ConfigV1::from_str(input, "microfrontends.jsonc");
+        assert!(
+            config.is_ok(),
+            "Parser should accept JSONC fixture with trailing commas"
+        );
+
+        let config = config.unwrap();
+        match config {
+            ParseResult::Actual(config_v1) => {
+                assert_eq!(config_v1.port("a"), Some(3000));
+                assert_eq!(config_v1.port("b"), Some(3001));
+                assert_eq!(config_v1.local_proxy_port(), Some(3000));
+                assert!(config_v1.routing("a").is_none());
+                assert!(config_v1.routing("b").is_some());
+            }
+            ParseResult::Reference(_) => panic!("expected to get main config"),
+        }
+    }
+
+    #[test]
+    fn test_missing_required_applications() {
+        // Even though applications has defaults, if JSON structure is invalid it should
+        // fail
+        let input = r#"{"applications": {, "web": {}}}"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json");
+        assert!(
+            config.is_err(),
+            "Parser should reject JSON with syntax errors"
+        );
+    }
+
+    #[test]
+    fn test_invalid_routing_structure() {
+        let input = r#"{
+        "applications": {
+          "docs": {
+            "routing": "invalid"
+          }
+        }
+      }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json");
+        assert!(
+            config.is_err(),
+            "Parser should reject routing that is not an array"
+        );
+    }
+
+    #[test]
+    fn test_invalid_path_group_structure() {
+        let input = r#"{
+        "applications": {
+          "docs": {
+            "routing": [
+              {
+                "group": "docs",
+                "paths": "should_be_array"
+              }
+            ]
+          }
+        }
+      }"#;
+        let config = ConfigV1::from_str(input, "microfrontends.json");
+        assert!(
+            config.is_err(),
+            "Parser should reject paths that is not an array"
+        );
+    }
+}

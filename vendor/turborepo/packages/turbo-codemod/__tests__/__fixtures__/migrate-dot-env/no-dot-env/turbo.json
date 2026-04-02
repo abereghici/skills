@@ -1,0 +1,14 @@
+{
+  "$schema": "https://turborepo.dev/schema.json",
+  "tasks": {
+    "build-one": {
+      "dependsOn": ["build-two"]
+    },
+    "build-two": {
+      "cache": false
+    },
+    "build-three": {
+      "persistent": true
+    }
+  }
+}

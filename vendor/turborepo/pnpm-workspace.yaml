@@ -1,0 +1,18 @@
+packages:
+  - apps/*
+  - cli
+  - docs/*
+  - packages/*
+  - turborepo-tests/*
+  - "!packages/turbo"
+  - crates/*/js
+  - examples
+  - "!examples/non-monorepo"
+  - lockfile-tests
+
+onlyBuiltDependencies:
+  - "@swc/core"
+  - "@vercel/speed-insights"
+  - core-js-pure
+  - esbuild
+  - sharp

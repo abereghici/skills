@@ -1,0 +1,44 @@
+{
+  "name": "turbo-ignore",
+  "version": "2.9.4-canary.3",
+  "description": "",
+  "keywords": [],
+  "homepage": "https://turborepo.dev",
+  "bugs": {
+    "url": "https://github.com/vercel/turborepo/issues"
+  },
+  "license": "MIT",
+  "author": "Jared Palmer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel/turborepo",
+    "directory": "packages/turbo-ignore"
+  },
+  "bin": "dist/cli.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "test": "jest",
+    "check-types": "tsc --noEmit",
+    "lint:prettier": "prettier -c . --cache --ignore-path=../../.prettierignore"
+  },
+  "dependencies": {
+    "json5": "2.2.3"
+  },
+  "devDependencies": {
+    "@jest/globals": "30.2.0",
+    "@turbo/telemetry": "workspace:*",
+    "@turbo/test-utils": "workspace:*",
+    "@turbo/tsconfig": "workspace:*",
+    "@turbo/types": "workspace:*",
+    "@turbo/utils": "workspace:*",
+    "@types/node": "18.17.4",
+    "commander": "11.0.0",
+    "jest": "30.2.0",
+    "ts-jest": "29.4.6",
+    "tsdown": "0.12.0",
+    "typescript": "5.5.4"
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "name": "@turbo/codemod",
+  "version": "2.9.4-canary.3",
+  "description": "Provides Codemod transformations to help upgrade your Turborepo codebase when a feature is deprecated.",
+  "homepage": "https://turborepo.dev",
+  "bugs": {
+    "url": "https://github.com/vercel/turborepo/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel/turborepo",
+    "directory": "packages/turbo-codemod"
+  },
+  "bin": "dist/cli.js",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "jest",
+    "check-types": "tsc --noEmit",
+    "lint:prettier": "prettier -c . --cache --ignore-path=../../.prettierignore"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.10.1",
+    "commander": "9.5.0",
+    "diff": "5.2.2",
+    "find-up": "4.1.0",
+    "fs-extra": "10.1.0",
+    "gradient-string": "2.0.1",
+    "is-git-clean": "1.1.0",
+    "json5": "2.2.3",
+    "ora": "4.1.1",
+    "picocolors": "1.0.1",
+    "semver": "7.5.2",
+    "update-check": "1.5.4",
+    "yaml": "2.7.1"
+  },
+  "devDependencies": {
+    "@jest/globals": "30.2.0",
+    "@turbo/test-utils": "workspace:*",
+    "@turbo/tsconfig": "workspace:*",
+    "@turbo/types": "workspace:*",
+    "@turbo/utils": "workspace:*",
+    "@turbo/workspaces": "workspace:*",
+    "@types/diff": "5.0.2",
+    "@types/fs-extra": "9.0.13",
+    "@types/gradient-string": "1.1.2",
+    "@types/node": "18.17.4",
+    "@types/semver": "7.3.12",
+    "@types/uuid": "9.0.0",
+    "deepmerge": "4.2.2",
+    "jest": "30.2.0",
+    "semver": "7.5.2",
+    "ts-jest": "29.4.6",
+    "tsdown": "0.12.0",
+    "typescript": "5.5.4"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "tasks": {
+    "build": {},
+    "builderror": {},
+    "builderror2": {
+      "outputLogs": "errors-only"
+    },
+    "buildsuccess": {
+      "outputLogs": "errors-only"
+    },
+    "nocachebuild": {
+      "cache": false
+    },
+    "nocachebuilderror": {
+      "cache": false
+    }
+  }
+}

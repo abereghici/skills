@@ -1,0 +1,11 @@
+{
+  "name": "root",
+  "version": "1.0.0",
+  "workspaces": [
+    "packages/*",
+    "!packages/ui"
+  ],
+  "dependencies": {},
+  "devDependencies": {},
+  "packageManager": "pnpm@8.15.4"
+}

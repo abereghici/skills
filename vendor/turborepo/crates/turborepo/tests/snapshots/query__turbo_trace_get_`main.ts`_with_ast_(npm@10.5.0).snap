@@ -1,0 +1,194 @@
+---
+source: crates/turborepo/tests/query.rs
+expression: query_output
+---
+{
+  "data": {
+    "file": {
+      "path": "main.ts",
+      "ast": {
+        "type": "Program",
+        "body": [
+          {
+            "type": "ImportDeclaration",
+            "specifiers": [
+              {
+                "type": "ImportSpecifier",
+                "imported": {
+                  "type": "Identifier",
+                  "decorators": [],
+                  "name": "Button",
+                  "optional": false,
+                  "typeAnnotation": null,
+                  "start": 9,
+                  "end": 15
+                },
+                "local": {
+                  "type": "Identifier",
+                  "decorators": [],
+                  "name": "Button",
+                  "optional": false,
+                  "typeAnnotation": null,
+                  "start": 9,
+                  "end": 15
+                },
+                "importKind": "value",
+                "start": 9,
+                "end": 15
+              }
+            ],
+            "source": {
+              "type": "Literal",
+              "value": "./button.tsx",
+              "raw": "\"./button.tsx\"",
+              "start": 23,
+              "end": 37
+            },
+            "phase": null,
+            "attributes": [],
+            "importKind": "value",
+            "start": 0,
+            "end": 38
+          },
+          {
+            "type": "ImportDeclaration",
+            "specifiers": [
+              {
+                "type": "ImportDefaultSpecifier",
+                "local": {
+                  "type": "Identifier",
+                  "decorators": [],
+                  "name": "foo",
+                  "optional": false,
+                  "typeAnnotation": null,
+                  "start": 46,
+                  "end": 49
+                },
+                "start": 46,
+                "end": 49
+              }
+            ],
+            "source": {
+              "type": "Literal",
+              "value": "./foo",
+              "raw": "\"./foo\"",
+              "start": 55,
+              "end": 62
+            },
+            "phase": null,
+            "attributes": [],
+            "importKind": "value",
+            "start": 39,
+            "end": 63
+          },
+          {
+            "type": "VariableDeclaration",
+            "kind": "const",
+            "declarations": [
+              {
+                "type": "VariableDeclarator",
+                "id": {
+                  "type": "Identifier",
+                  "decorators": [],
+                  "name": "button",
+                  "optional": false,
+                  "typeAnnotation": null,
+                  "start": 71,
+                  "end": 77
+                },
+                "init": {
+                  "type": "NewExpression",
+                  "callee": {
+                    "type": "Identifier",
+                    "decorators": [],
+                    "name": "Button",
+                    "optional": false,
+                    "typeAnnotation": null,
+                    "start": 84,
+                    "end": 90
+                  },
+                  "typeArguments": null,
+                  "arguments": [],
+                  "start": 80,
+                  "end": 92
+                },
+                "definite": false,
+                "start": 71,
+                "end": 92
+              }
+            ],
+            "declare": false,
+            "start": 65,
+            "end": 93
+          },
+          {
+            "type": "ExpressionStatement",
+            "expression": {
+              "type": "CallExpression",
+              "callee": {
+                "type": "MemberExpression",
+                "object": {
+                  "type": "Identifier",
+                  "decorators": [],
+                  "name": "button",
+                  "optional": false,
+                  "typeAnnotation": null,
+                  "start": 95,
+                  "end": 101
+                },
+                "property": {
+                  "type": "Identifier",
+                  "decorators": [],
+                  "name": "render",
+                  "optional": false,
+                  "typeAnnotation": null,
+                  "start": 102,
+                  "end": 108
+                },
+                "optional": false,
+                "computed": false,
+                "start": 95,
+                "end": 108
+              },
+              "typeArguments": null,
+              "arguments": [],
+              "optional": false,
+              "start": 95,
+              "end": 110
+            },
+            "directive": null,
+            "start": 95,
+            "end": 111
+          },
+          {
+            "type": "ExpressionStatement",
+            "expression": {
+              "type": "CallExpression",
+              "callee": {
+                "type": "Identifier",
+                "decorators": [],
+                "name": "foo",
+                "optional": false,
+                "typeAnnotation": null,
+                "start": 112,
+                "end": 115
+              },
+              "typeArguments": null,
+              "arguments": [],
+              "optional": false,
+              "start": 112,
+              "end": 117
+            },
+            "directive": null,
+            "start": 112,
+            "end": 118
+          }
+        ],
+        "sourceType": "module",
+        "hashbang": null,
+        "start": 0,
+        "end": 119
+      }
+    }
+  }
+}

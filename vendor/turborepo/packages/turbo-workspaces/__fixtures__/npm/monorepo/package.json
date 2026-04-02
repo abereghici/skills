@@ -1,0 +1,14 @@
+{
+  "name": "npm-workspaces",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "packageManager": "npm@8.19.4"
+}

@@ -1,0 +1,70 @@
+#![feature(assert_matches)]
+#![feature(box_patterns)]
+#![feature(error_generic_member_access)]
+#![feature(once_cell_try)]
+#![feature(try_blocks)]
+#![feature(impl_trait_in_assoc_type)]
+// miette's derive macro causes false positives for this lint
+#![allow(unused_assignments)]
+#![deny(clippy::all)]
+// Clippy's needless mut lint is buggy: https://github.com/rust-lang/rust-clippy/issues/11299
+#![allow(clippy::needless_pass_by_ref_mut)]
+#![allow(clippy::result_large_err)]
+#![allow(dead_code)]
+
+mod child;
+mod cli;
+mod commands;
+mod config;
+pub mod devtools;
+mod engine;
+
+mod boundaries;
+mod microfrontends;
+mod opts;
+mod package_changes_watcher;
+mod panic_handler;
+mod rayon_compat;
+mod run;
+mod shim;
+mod task_change_detector;
+mod task_graph;
+mod task_hash;
+mod tracing;
+mod turbo_json;
+
+pub use run::package_discovery::DaemonPackageDiscovery;
+// Re-export daemon types from the new crate location
+pub use turborepo_daemon::{
+    DaemonClient, DaemonConnector, DaemonConnectorError, DaemonError, Paths as DaemonPaths,
+};
+pub use turborepo_query_api::QueryServer;
+
+pub use crate::{child::spawn_child, cli::Args, panic_handler::panic_handler};
+
+pub fn get_version() -> &'static str {
+    include_str!("../../../version.txt")
+        .split_once('\n')
+        .expect("Failed to read version from version.txt")
+        .0
+        // On windows we still have a trailing \r
+        .trim_end()
+}
+
+/// Main entry point for the turborepo CLI.
+///
+/// `query_server` provides the GraphQL query execution layer. When `None`,
+/// the `turbo query` command returns an error and the Web UI mode falls
+/// back silently. Pass `Some(...)` with a [`QueryServer`] implementation
+/// to enable the full query subsystem.
+pub fn main(
+    query_server: Option<std::sync::Arc<dyn turborepo_query_api::QueryServer>>,
+) -> Result<i32, shim::Error> {
+    shim::run(query_server)
+}
+
+#[cfg(all(feature = "native-tls", feature = "rustls-tls"))]
+compile_error!("You can't enable both the `native-tls` and `rustls-tls` feature.");
+
+#[cfg(all(not(feature = "native-tls"), not(feature = "rustls-tls")))]
+compile_error!("You have to enable one of the TLS features: `native-tls` or `rustls-tls`");

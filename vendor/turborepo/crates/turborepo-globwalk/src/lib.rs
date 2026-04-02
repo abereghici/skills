@@ -1,0 +1,2276 @@
+//! Glob pattern matching and directory walking
+//! This is a layer on top of `wax` that performs some corrections to user
+//! provided globs as well as escaping characters that `wax` considers special,
+//! but we do not support.
+
+#![feature(assert_matches)]
+#![deny(clippy::all)]
+
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::OnceLock,
+};
+
+use itertools::Itertools;
+use path_clean::PathClean;
+use path_slash::PathExt;
+use rayon::prelude::*;
+use regex::Regex;
+use tracing::debug;
+use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, PathError, RelativeUnixPath};
+use wax::{
+    BuildError, Glob, Program,
+    walk::{FileIterator, FilterAny, LinkBehavior, WalkBehavior},
+};
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum WalkType {
+    Files,
+    Folders,
+    All,
+}
+
+pub use walkdir::Error as WalkDirError;
+use wax::walk::{Entry, EntryResidue};
+
+#[derive(Debug, thiserror::Error)]
+pub enum WalkError {
+    // note: wax 0.5 has a lifetime in the BuildError, so we can't use it here
+    #[error("bad pattern {0}: {1}")]
+    BadPattern(String, Box<BuildError>),
+    #[error("invalid path")]
+    InvalidPath,
+    #[error("walk error: {0}")]
+    WalkError(#[from] walkdir::Error),
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error(transparent)]
+    WaxWalk(#[from] wax::walk::WalkError),
+    #[error("Internal error on glob {glob}: {error}")]
+    InternalError { glob: String, error: String },
+    #[error("IO Error: {0}")]
+    IO(#[from] std::io::Error),
+}
+
+fn join_unix_like_paths(a: &str, b: &str) -> String {
+    [a.trim_end_matches('/'), "/", b.trim_start_matches('/')].concat()
+}
+
+fn glob_literals() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?<literal>[\?\*\$:<>\(\)\[\]{},])").unwrap())
+}
+
+fn escape_glob_literals(literal_glob: &str) -> Cow<'_, str> {
+    glob_literals().replace_all(literal_glob, "\\$literal")
+}
+
+#[tracing::instrument(skip(include, exclude))]
+fn preprocess_paths_and_globs<S: AsRef<str>>(
+    base_path: &AbsoluteSystemPath,
+    include: &[S],
+    exclude: &[S],
+) -> Result<(PathBuf, Vec<String>, Vec<String>), WalkError> {
+    let raw_slash = base_path
+        .as_std_path()
+        .to_slash()
+        .ok_or(WalkError::InvalidPath)?;
+    let base_path_slash = escape_glob_literals(&raw_slash);
+
+    let (include_paths, lowest_segment) = {
+        let mut paths = Vec::with_capacity(include.len());
+        let mut lowest = usize::MAX;
+        for s in include {
+            let mut fixed = fix_glob_pattern(s.as_ref()).into_owned();
+            // We need to check inclusion globs before the join
+            // as to_slash doesn't preserve Windows drive names.
+            add_doublestar_to_dir(base_path, &mut fixed);
+            let joined = join_unix_like_paths(&base_path_slash, &fixed);
+            if let Some((collapsed, segment)) = collapse_path(&joined) {
+                lowest = std::cmp::min(lowest, segment);
+                paths.push(collapsed.into_owned());
+            }
+        }
+        (paths, lowest)
+    };
+
+    let base_path = base_path
+        .components()
+        .take(
+            // this can be usize::MAX if there are no include paths
+            lowest_segment.saturating_add(1),
+        )
+        .collect::<PathBuf>();
+
+    let mut exclude_paths = Vec::with_capacity(exclude.len() * 2);
+    for s in exclude {
+        let fixed = fix_glob_pattern(s.as_ref());
+        let joined = join_unix_like_paths(&base_path_slash, fixed.as_ref());
+        if let Some((collapsed, _)) = collapse_path(&joined) {
+            add_trailing_double_star(&mut exclude_paths, &collapsed);
+        }
+    }
+
+    Ok((base_path, include_paths, exclude_paths))
+}
+
+fn double_doublestar() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*\*(?:/\*\*)+").unwrap())
+}
+
+fn leading_doublestar() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*\*(?P<suffix>[^*/]+)").unwrap())
+}
+
+fn trailing_doublestar() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?P<prefix>[^*/]+)\*\*").unwrap())
+}
+
+pub fn fix_glob_pattern(pattern: &str) -> Cow<'_, str> {
+    // On Unix, Path::new(pattern).to_slash() is a no-op that returns Cow::Borrowed.
+    // Skip the roundtrip entirely on Unix to avoid the overhead.
+    #[cfg(not(windows))]
+    let p0: Cow<'_, str> = Cow::Borrowed(pattern);
+
+    #[cfg(windows)]
+    let p0: Cow<'_, str> = {
+        // path-slash strips trailing slashes from Windows paths, so we need to restore
+        // them.
+        let needs_trailing_slash = pattern.ends_with('/') || pattern.ends_with('\\');
+        let converted = Path::new(pattern)
+            .to_slash()
+            .expect("failed to roundtrip through Path");
+        if needs_trailing_slash && !converted.ends_with('/') {
+            Cow::Owned(format!("{converted}/"))
+        } else {
+            converted
+        }
+    };
+
+    // Chain regex replacements, taking advantage of Cow<str>:
+    // - If no match, replace() returns Cow::Borrowed pointing to the input
+    // - If match, replace() returns Cow::Owned with the replacement
+    // This avoids allocations when patterns don't need modification.
+    let p1 = double_doublestar().replace(&p0, "**");
+    let p2 = leading_doublestar().replace(&p1, "**/*$suffix");
+    let p3 = trailing_doublestar().replace(&p2, "$prefix*/**");
+
+    // Determine if we can return a borrowed reference to the original pattern.
+    // On Unix, if no regex matched, all Cows in the chain are Borrowed and
+    // transitively reference `pattern`. We can detect this by checking if
+    // p3's pointer equals pattern's pointer.
+    //
+    // On Windows, p0 may be Owned (if path conversion changed something), so
+    // we can only return Borrowed if p0 was also Borrowed.
+    match p3 {
+        Cow::Borrowed(s) if std::ptr::eq(s, pattern) => {
+            // No allocations occurred anywhere in the chain
+            Cow::Borrowed(pattern)
+        }
+        Cow::Borrowed(s) => {
+            // p3 is borrowed from an intermediate owned string (some regex matched).
+            // We need to allocate to return an owned copy.
+            Cow::Owned(s.to_string())
+        }
+        Cow::Owned(s) => Cow::Owned(s),
+    }
+}
+
+/// collapse a path, returning a new path with all the dots and dotdots removed
+///
+/// also returns the position in the path of the first encountered collapse,
+/// for the purposes of calculating the new base path
+fn collapse_path(path: &str) -> Option<(Cow<'_, str>, usize)> {
+    let mut stack: Vec<&str> = vec![];
+    let mut changed = false;
+    let is_root = path.starts_with('/');
+
+    // the index of the lowest segment that was collapsed
+    // this is defined as the lowest stack size after a collapse
+    let mut lowest_index = None;
+
+    for segment in path.trim_start_matches('/').split('/') {
+        match segment {
+            ".." => {
+                stack.pop()?;
+                // Set this value post-pop so that we capture
+                // the remaining prefix, and not the segment we're
+                // about to remove. Note that this gets papered over
+                // below when we compare against the current stack length.
+                lowest_index.get_or_insert(stack.len());
+                changed = true;
+            }
+            "." => {
+                lowest_index.get_or_insert(stack.len());
+                changed = true;
+            }
+            _ => stack.push(segment),
+        }
+        if let Some(lowest_index) = lowest_index.as_mut() {
+            *lowest_index = (*lowest_index).min(stack.len());
+        }
+    }
+
+    let lowest_index = lowest_index.unwrap_or(stack.len());
+    if !changed {
+        Some((Cow::Borrowed(path), lowest_index))
+    } else {
+        let string = if is_root {
+            std::iter::once("").chain(stack).join("/")
+        } else {
+            stack.join("/")
+        };
+
+        Some((Cow::Owned(string), lowest_index))
+    }
+}
+
+fn add_trailing_double_star(exclude_paths: &mut Vec<String>, glob: &str) {
+    if let Some(stripped) = glob.strip_suffix('/') {
+        if stripped.ends_with("**") {
+            exclude_paths.push(stripped.to_string());
+        } else {
+            exclude_paths.push(format!("{glob}**"));
+        }
+    } else if glob.ends_with("/**") {
+        exclude_paths.push(glob.to_string());
+    } else {
+        // Match Go globby behavior. If the glob doesn't already end in /**, add it
+        // We use the unix style operator as wax expects unix style paths
+        exclude_paths.push(format!("{glob}/**"));
+        exclude_paths.push(glob.to_string());
+    }
+}
+
+fn add_doublestar_to_dir(base: &AbsoluteSystemPath, glob: &mut String) {
+    // If the glob has a glob literal in it e.g. *
+    // then skip trying to read it as a file path.
+    if glob_literals().is_match(&*glob) {
+        return;
+    }
+
+    // Globs are given in unix style
+    let Ok(glob_path) = RelativeUnixPath::new(&*glob) else {
+        // Glob isn't valid relative unix path so can't check if dir
+        debug!("'{glob}' isn't valid path");
+        return;
+    };
+
+    let path = base.join_unix_path(glob_path);
+
+    let Ok(metadata) = path.symlink_metadata() else {
+        debug!("'{path}' doesn't have metadata");
+        return;
+    };
+
+    if !metadata.is_dir() {
+        return;
+    }
+
+    debug!("'{path}' is a directory");
+
+    // Glob points to a dir, must add **
+    if !glob.ends_with('/') {
+        glob.push('/');
+    }
+    glob.push_str("**");
+}
+
+fn glob_with_contextual_error<S: AsRef<str>>(raw: S) -> Result<Glob<'static>, WalkError> {
+    let raw = raw.as_ref();
+    Glob::new(raw)
+        .map(|g| g.into_owned())
+        .map_err(|e| WalkError::BadPattern(raw.to_string(), Box::new(e)))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid globwalking input {raw_input}: {reason}")]
+pub struct GlobError {
+    raw_input: String,
+    reason: String,
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+pub struct Settings {
+    /// Don't recurse into a directory if it contains a `package.json` file.
+    /// NOTE: If globbing from the root of a workspace, this setting will cause
+    /// us to not recurse into the individual packages. Therefore, only use this
+    /// setting if you are globbing in an individual package at not at the
+    /// workspace root.
+    ignore_nested_packages: bool,
+    /// Follow symbolic links when walking directories. When enabled, symlinked
+    /// directories are traversed into (their targets are read). Cycles are
+    /// detected and handled gracefully by the underlying walkdir layer.
+    follow_links: bool,
+}
+
+impl Settings {
+    pub fn ignore_nested_packages(mut self) -> Self {
+        self.ignore_nested_packages = true;
+        self
+    }
+
+    pub fn follow_links(mut self) -> Self {
+        self.follow_links = true;
+        self
+    }
+}
+
+/// ValidatedGlob.
+///
+/// Represents an input string that we have either validated or
+/// modified to fit our constraints. It does not _yet_ validate that the glob is
+/// a valid glob pattern, just that we have checked for unix format, ':'s, clean
+/// paths, etc.
+#[derive(Clone, Debug)]
+pub struct ValidatedGlob {
+    inner: String,
+}
+
+impl ValidatedGlob {
+    pub fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
+}
+
+impl AsRef<str> for ValidatedGlob {
+    fn as_ref(&self) -> &str {
+        self.inner.as_str()
+    }
+}
+
+impl FromStr for ValidatedGlob {
+    type Err = GlobError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Valid globs:
+        // 1. are to_slash'd,
+        // 2. are relative
+        // 3. directory traversals are leading or not at all
+        // 4. single `.`s removed
+        // 5. colons escaped on unix, error on windows
+
+        #[cfg(not(windows))]
+        {
+            // Fast path: check if cleaning is needed by looking for `.` or `..` segments
+            let needs_cleaning = needs_path_cleaning(s);
+
+            let cleaned: Cow<'_, str> = if needs_cleaning {
+                // Only allocate when we actually need to clean
+                let path = Path::new(s);
+                let cleaned_path = path.clean();
+                Cow::Owned(cleaned_path.to_str().expect("valid utf-8").to_owned())
+            } else {
+                Cow::Borrowed(s)
+            };
+
+            // Strip leading slashes
+            let without_leading_slash = cleaned.trim_start_matches('/');
+
+            // Only allocate for colon escaping if colons are present (rare case)
+            let result = if without_leading_slash.contains(':') {
+                without_leading_slash.replace(':', "\\:")
+            } else {
+                without_leading_slash.to_owned()
+            };
+
+            Ok(Self { inner: result })
+        }
+
+        #[cfg(windows)]
+        {
+            // On Windows, we need to convert backslashes to forward slashes
+            let needs_slash_conversion = s.contains('\\');
+            let needs_cleaning = needs_path_cleaning(s);
+
+            // If we need either conversion, we have to allocate
+            let processed: Cow<'_, str> = if needs_slash_conversion || needs_cleaning {
+                let path = Path::new(s);
+                let cleaned_path = path.clean();
+                let cleaned_str = cleaned_path.to_str().expect("valid utf-8");
+                if needs_slash_conversion || cleaned_str.contains('\\') {
+                    Cow::Owned(cleaned_str.replace('\\', "/"))
+                } else {
+                    Cow::Owned(cleaned_str.to_owned())
+                }
+            } else {
+                Cow::Borrowed(s)
+            };
+
+            // Check for invalid ':' character on Windows
+            if let Some(index) = processed.find(':') {
+                return Err(GlobError {
+                    raw_input: s.to_owned(),
+                    reason: format!(
+                        "Found invalid windows relative path character ':' at position {index}"
+                    ),
+                });
+            }
+
+            Ok(Self {
+                inner: processed.into_owned(),
+            })
+        }
+    }
+}
+
+/// Check if a path string needs cleaning (contains `.` or `..` segments).
+/// This is a fast check to avoid allocations in the common case.
+#[inline]
+fn needs_path_cleaning(s: &str) -> bool {
+    // We need to check for actual path segments, not just any dot
+    // A segment is defined by being surrounded by '/' or at start/end
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    let mut i = 0;
+    while i < len {
+        // Check for segment start (beginning of string or after '/')
+        let at_segment_start = i == 0 || bytes[i - 1] == b'/';
+
+        if at_segment_start && bytes[i] == b'.' {
+            // Check for "." segment (single dot followed by '/' or end)
+            if i + 1 == len || bytes[i + 1] == b'/' {
+                return true;
+            }
+            // Check for ".." segment (double dot followed by '/' or end)
+            if i + 1 < len && bytes[i + 1] == b'.' && (i + 2 == len || bytes[i + 2] == b'/') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns true if the pattern contains glob metacharacters (*, ?, [, {).
+/// Literal file paths return false.
+pub fn is_glob_pattern(pattern: &str) -> bool {
+    // Check for unescaped glob metacharacters
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Skip escaped character
+            chars.next();
+            continue;
+        }
+        if matches!(c, '*' | '?' | '[' | '{') {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn globwalk_with_settings(
+    base_path: &AbsoluteSystemPath,
+    include: &[ValidatedGlob],
+    exclude: &[ValidatedGlob],
+    walk_type: WalkType,
+    settings: Settings,
+) -> Result<HashSet<AbsoluteSystemPathBuf>, WalkError> {
+    let compiled = compile_globs(base_path, include, exclude)?;
+    retry_on_emfile(|| walk_compiled_globs(&compiled, walk_type, settings))
+}
+
+pub fn globwalk(
+    base_path: &AbsoluteSystemPath,
+    include: &[ValidatedGlob],
+    exclude: &[ValidatedGlob],
+    walk_type: WalkType,
+) -> Result<HashSet<AbsoluteSystemPathBuf>, WalkError> {
+    let compiled = compile_globs(base_path, include, exclude)?;
+    retry_on_emfile(|| walk_compiled_globs(&compiled, walk_type, Default::default()))
+}
+
+fn is_too_many_open_files(err: &WalkError) -> bool {
+    // visit_file converts all walkdir/wax errors into WalkError::IO,
+    // so this is the only variant we need to check.
+    let WalkError::IO(e) = err else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(24)
+    } // EMFILE
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(4)
+    } // ERROR_TOO_MANY_OPEN_FILES
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn retry_on_emfile<F>(mut f: F) -> Result<HashSet<AbsoluteSystemPathBuf>, WalkError>
+where
+    F: FnMut() -> Result<HashSet<AbsoluteSystemPathBuf>, WalkError>,
+{
+    const MAX_RETRIES: u32 = 10;
+    const BASE_DELAY_MS: u64 = 10;
+    const MAX_DELAY_MS: u64 = 1000;
+
+    for attempt in 0..MAX_RETRIES {
+        match f() {
+            Ok(result) => return Ok(result),
+            Err(err) if is_too_many_open_files(&err) => {
+                let delay = std::cmp::min(BASE_DELAY_MS * 2u64.pow(attempt), MAX_DELAY_MS);
+                debug!(
+                    attempt = attempt + 1,
+                    delay_ms = delay,
+                    "too many open files, retrying globwalk"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    // Final attempt — propagate whatever happens.
+    f()
+}
+
+struct CompiledGlobs {
+    base_path: PathBuf,
+    include_patterns: Vec<Glob<'static>>,
+    ex_patterns: Vec<Glob<'static>>,
+    ex_filter: FilterAny,
+}
+
+#[tracing::instrument(skip(include, exclude))]
+fn compile_globs<S: AsRef<str>>(
+    base_path: &AbsoluteSystemPath,
+    include: &[S],
+    exclude: &[S],
+) -> Result<CompiledGlobs, WalkError> {
+    let (base_path_new, include_paths, exclude_paths) =
+        preprocess_paths_and_globs(base_path, include, exclude)?;
+
+    let ex_patterns: Vec<Glob<'static>> = exclude_paths
+        .into_iter()
+        .map(glob_with_contextual_error)
+        .collect::<Result<_, _>>()?;
+
+    let ex_filter = FilterAny::any(ex_patterns.clone())
+        .map_err(|e| WalkError::BadPattern("exclusion".into(), Box::new(e)))?;
+
+    let include_patterns = include_paths
+        .into_par_iter()
+        .map(glob_with_contextual_error)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CompiledGlobs {
+        base_path: base_path_new,
+        include_patterns,
+        ex_patterns,
+        ex_filter,
+    })
+}
+
+/// Try to decompose a glob pattern relative to `base_path` into
+/// `(literal_prefix, literal_suffix)` separated by a single `*` segment.
+///
+/// For example, with base `/repo` and glob pattern matching
+/// `/repo/packages/*/package.json`, this returns
+/// `Some(("/repo/packages", "package.json"))`.
+///
+/// Returns `None` if the pattern doesn't have exactly one `*` wildcard segment
+/// or contains `**`, `?`, `[`, or `{` metacharacters.
+fn try_decompose_shallow_wildcard(
+    _base_path: &Path,
+    glob: &Glob<'_>,
+) -> Option<(PathBuf, PathBuf)> {
+    // Wax glob patterns are relative to the base path that `walk` is called
+    // with, but `preprocess_paths_and_globs` joins them with the absolute base
+    // path before compilation. So `glob.to_string()` returns an absolute path
+    // like `/repo/packages/*/package.json`. We need to work with the full
+    // absolute path and extract the prefix/suffix around the `*`.
+    let pattern = glob.to_string();
+
+    // Quick reject: skip patterns with complex metacharacters.
+    if pattern.contains("**")
+        || pattern.contains('?')
+        || pattern.contains('[')
+        || pattern.contains('{')
+    {
+        return None;
+    }
+
+    // Split on '/' and find segments containing `*`. Filter out empty segments
+    // (leading '/' on absolute paths creates one).
+    let segments: Vec<&str> = pattern.split('/').collect();
+    let star_positions: Vec<usize> = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty() && s.contains('*'))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Must have exactly one segment containing `*`, and it must be exactly `*`.
+    if star_positions.len() != 1 {
+        return None;
+    }
+    let star_idx = star_positions[0];
+    if segments[star_idx] != "*" {
+        return None;
+    }
+
+    // Require at least one suffix segment after the star — patterns like `dir/*`
+    // match files directly and need the full walker.
+    if star_idx + 1 >= segments.len() {
+        return None;
+    }
+
+    // Build the literal prefix from the segments before the star.
+    // For absolute paths like "/repo/packages", rejoin with '/' separator.
+    let prefix: PathBuf = segments[..star_idx].join("/").into();
+
+    // Build the literal suffix from segments after the star.
+    let suffix: PathBuf = segments[star_idx + 1..].iter().collect();
+
+    // The prefix must be an existing directory.
+    if !prefix.is_dir() {
+        return None;
+    }
+
+    Some((prefix, suffix))
+}
+
+fn walk_compiled_globs(
+    compiled: &CompiledGlobs,
+    walk_type: WalkType,
+    settings: Settings,
+) -> Result<HashSet<AbsoluteSystemPathBuf>, WalkError> {
+    // Partition globs into three categories for optimal dispatch:
+    //
+    // 1. Invariant (no wildcards) — resolved via a single stat syscall.
+    // 2. Shallow wildcard (`<prefix>/*/<suffix>`) — expanded via readdir on the
+    //    prefix dir, then each child is checked in parallel. This avoids the
+    //    walkdir overhead for patterns like `packages/*/package.json` where a
+    //    single glob walker would sequentially traverse hundreds of entries.
+    // 3. General variant — full wax directory walk (one rayon task per pattern).
+    let mut literal_results: Vec<AbsoluteSystemPathBuf> = Vec::new();
+    let mut shallow_wildcards: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut variant_globs: Vec<&Glob<'static>> = Vec::new();
+
+    for glob in &compiled.include_patterns {
+        if let Some(path) = glob.variance().path() {
+            // Invariant: no wildcards at all — single stat.
+            let full_path = compiled.base_path.join(path);
+            let dominated = full_path
+                .symlink_metadata()
+                .ok()
+                .is_some_and(|m| match walk_type {
+                    WalkType::Files => m.is_file() || m.is_symlink(),
+                    WalkType::Folders => m.is_dir(),
+                    WalkType::All => true,
+                });
+            if dominated && let Ok(abs) = AbsoluteSystemPathBuf::try_from(full_path.as_path()) {
+                literal_results.push(abs);
+            }
+        } else if let Some(decomposed) = try_decompose_shallow_wildcard(&compiled.base_path, glob) {
+            shallow_wildcards.push(decomposed);
+        } else {
+            variant_globs.push(glob);
+        }
+    }
+
+    // Expand shallow wildcards: readdir each prefix, then stat candidates in
+    // parallel. This turns one slow sequential walk (e.g. 54ms for 603 dirs)
+    // into a batch of parallel stat calls spread across all rayon workers.
+    let shallow_candidates: Vec<PathBuf> = shallow_wildcards
+        .iter()
+        .flat_map(|(prefix, suffix)| {
+            let Ok(entries) = std::fs::read_dir(prefix) else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().join(suffix))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let ex_patterns = &compiled.ex_patterns;
+    let shallow_results: Vec<AbsoluteSystemPathBuf> = shallow_candidates
+        .par_iter()
+        .filter_map(|candidate| {
+            let meta = candidate.symlink_metadata().ok()?;
+            let dominated = match walk_type {
+                WalkType::Files => meta.is_file() || meta.is_symlink(),
+                WalkType::Folders => meta.is_dir(),
+                WalkType::All => true,
+            };
+            if !dominated {
+                return None;
+            }
+            // Check exclusion patterns. Exclusion globs are compiled from
+            // absolute paths (e.g. `/repo/**/node_modules/**`), so match
+            // against the full candidate path using slash-normalized form for
+            // cross-platform correctness.
+            if !ex_patterns.is_empty() {
+                let candidate_str = candidate.to_slash_lossy();
+                if ex_patterns
+                    .iter()
+                    .any(|ex| ex.is_match(candidate_str.as_ref()))
+                {
+                    return None;
+                }
+            }
+            AbsoluteSystemPathBuf::try_from(candidate.as_path()).ok()
+        })
+        .collect();
+
+    let mut results: HashSet<AbsoluteSystemPathBuf> = variant_globs
+        .par_iter()
+        .flat_map_iter(|glob| {
+            walk_glob(
+                walk_type,
+                &compiled.base_path,
+                compiled.ex_filter.clone(),
+                glob,
+                settings,
+            )
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    results.extend(literal_results);
+    results.extend(shallow_results);
+    Ok(results)
+}
+
+#[tracing::instrument(skip_all)]
+fn walk_glob(
+    walk_type: WalkType,
+    base_path_new: &Path,
+    ex_filter: FilterAny,
+    glob: &Glob<'static>,
+    settings: Settings,
+) -> Vec<Result<AbsoluteSystemPathBuf, WalkError>> {
+    let behavior = if settings.follow_links {
+        WalkBehavior {
+            link: LinkBehavior::ReadTarget,
+            ..Default::default()
+        }
+    } else {
+        WalkBehavior::default()
+    };
+    let iter = glob
+        .walk_with_behavior(base_path_new, behavior)
+        .not_any(ex_filter);
+
+    if settings.ignore_nested_packages {
+        iter.filter_entry(|entry| {
+            let path = entry.path();
+            if path.is_dir() && path != base_path_new && path.join("package.json").exists() {
+                return Some(EntryResidue::Tree);
+            }
+
+            None
+        })
+        .filter_map(|entry| visit_file(walk_type, entry))
+        .collect::<Vec<_>>()
+    } else {
+        iter.filter_map(|entry| visit_file(walk_type, entry))
+            .collect::<Vec<_>>()
+    }
+}
+
+fn visit_file(
+    walk_type: WalkType,
+    entry: Result<wax::walk::GlobEntry, wax::walk::WalkError>,
+) -> Option<Result<AbsoluteSystemPathBuf, WalkError>> {
+    match entry {
+        Ok(entry)
+            if walk_type == WalkType::Files
+                && !entry.file_type().is_file()
+                && !entry.file_type().is_symlink() =>
+        {
+            None
+        }
+        Ok(entry) => Some(AbsoluteSystemPathBuf::try_from(entry.path()).map_err(|e| e.into())),
+        Err(e) => {
+            let io_err = std::io::Error::from(e);
+            match io_err.kind() {
+                // Ignore missing file and permission errors
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => None,
+                _ => Some(Err(io_err.into())),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{collections::HashSet, str::FromStr};
+
+    use itertools::Itertools;
+    use tempfile::TempDir;
+    use test_case::test_case;
+    use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf};
+
+    use crate::{
+        Settings, ValidatedGlob, WalkError, WalkType, add_doublestar_to_dir, collapse_path,
+        escape_glob_literals, fix_glob_pattern, globwalk, needs_path_cleaning,
+    };
+
+    #[cfg(unix)]
+    const ROOT: &str = "/";
+    #[cfg(windows)]
+    const ROOT: &str = "C:\\";
+    #[cfg(unix)]
+    const GLOB_ROOT: &str = "/";
+    #[cfg(windows)]
+    const GLOB_ROOT: &str = "C\\:/"; // in globs, expect an escaped ':' token
+
+    #[test_case("a", "a" ; "no change")]
+    #[test_case("**/**", "**")]
+    #[test_case("**/**/**", "**" ; "Triple doublestar")]
+    #[test_case("**token/foo", "**/*token/foo")]
+    #[test_case("**token**", "**/*token*/**")]
+    fn test_fix_glob_pattern(input: &str, expected: &str) {
+        let output = fix_glob_pattern(input);
+        assert_eq!(output.as_ref(), expected);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_fix_glob_pattern_returns_borrowed_when_no_change() {
+        use std::borrow::Cow;
+        // On Unix, when no regex matches, we should get a borrowed reference
+        // to the original string, avoiding allocation.
+        let input = "packages/*/src/**/*.ts";
+        let output = fix_glob_pattern(input);
+        assert!(
+            matches!(output, Cow::Borrowed(_)),
+            "expected Cow::Borrowed for pattern that needs no modification"
+        );
+        // Verify it's actually the same memory
+        assert!(std::ptr::eq(output.as_ref(), input));
+    }
+
+    #[test]
+    fn test_fix_glob_pattern_returns_owned_when_changed() {
+        use std::borrow::Cow;
+        // When a regex matches, we should get an owned string
+        let input = "**/**";
+        let output = fix_glob_pattern(input);
+        assert!(
+            matches!(output, Cow::Owned(_)),
+            "expected Cow::Owned for pattern that needs modification"
+        );
+        assert_eq!(output.as_ref(), "**");
+    }
+
+    #[test_case("a/./././b", "a/b", 1 ; "test path with dot segments")]
+    #[test_case("a/../b", "b", 0 ; "test path with dotdot segments")]
+    #[test_case("a/./../b", "b", 0 ; "test path with mixed dot and dotdot segments")]
+    #[test_case("./a/b", "a/b", 0 ; "test path starting with dot segment")]
+    #[test_case("a/b/..", "a", 1 ; "test path ending with dotdot segment")]
+    #[test_case("a/b/.", "a/b", 2 ; "test path ending with dot segment")]
+    #[test_case("a/.././b", "b", 0 ; "test path with mixed and consecutive ./ and ../ segments")]
+    #[test_case("/a/./././b", "/a/b", 1 ; "test path with leading / and ./ segments")]
+    #[test_case("/a/../b", "/b", 0 ; "test path with leading / and dotdot segments")]
+    #[test_case("/a/./../b", "/b", 0 ; "test path with leading / and mixed dot and dotdot segments")]
+    #[test_case("/./a/b", "/a/b", 0 ; "test path with leading / and starting with dot segment")]
+    #[test_case("/a/b/..", "/a", 1 ; "test path with leading / and ending with dotdot segment")]
+    #[test_case("/a/b/.", "/a/b", 2 ; "test path with leading / and ending with dot segment")]
+    #[test_case("/a/.././b", "/b", 0 ; "test path with leading / and mixed and consecutive dot and dotdot segments")]
+    #[test_case("/a/b/c/../../d/e/f/g/h/i/../j", "/a/d/e/f/g/h/j", 1 ; "leading collapse followed by shorter one")]
+    fn test_collapse_path(glob: &str, expected: &str, earliest_collapsed_segment: usize) {
+        let (glob, segment) = collapse_path(glob).unwrap();
+        assert_eq!(glob, expected);
+        assert_eq!(segment, earliest_collapsed_segment);
+    }
+
+    #[test_case("../a/b" ; "test path starting with ../ segment should return None")]
+    #[test_case("/../a" ; "test path with leading dotdotdot segment should return None")]
+    fn test_collapse_path_not(glob: &str) {
+        assert_eq!(collapse_path(glob), None);
+    }
+
+    #[test_case("a/b/c/d", &["/e/../../../f"], &[], "a/b", None, None ; "can traverse beyond the root")]
+    #[test_case("a/b/c/d/", &["/e/../../../f"], &[], "a/b", None, None ; "can handle slash-trailing base path")]
+    #[test_case("a/b/c/d/", &["e/../../../f"], &[], "a/b", None, None ; "can handle no slash on glob")]
+    #[test_case("a/b/c/d", &["e/../../../f"], &[], "a/b", None, None ; "can handle no slash on either")]
+    #[test_case("a/b/c/d", &["/e/f/../g"], &[], "a/b/c/d", None, None ; "can handle no collapse")]
+    #[test_case("a/b/c/d", &["./././../.."], &[], "a/b", None, None ; "can handle dot followed by dotdot")]
+    #[test_case("a/b/c/d", &["**"], &["**/"], "a/b/c/d", None, Some(&["a/b/c/d/**"]) ; "can handle dot followed by dotdot and dot")]
+    #[test_case("a/b/c", &["**"], &["d/"], "a/b/c", None, Some(&["a/b/c/d/**"]) ; "will exclude all subfolders")]
+    #[test_case("a/b/c", &["**"], &["d"], "a/b/c", None, Some(&["a/b/c/d/**", "a/b/c/d"]) ; "will exclude all subfolders and file")]
+    fn preprocess_paths_and_globs(
+        base_path: &str,
+        include: &[&str],
+        exclude: &[&str],
+        base_path_exp: &str,
+        include_exp: Option<&[&str]>,
+        exclude_exp: Option<&[&str]>,
+    ) {
+        let raw_path = format!("{ROOT}{base_path}");
+        let base_path = AbsoluteSystemPathBuf::new(raw_path).unwrap();
+        let include = include.iter().map(|s| s.to_string()).collect_vec();
+        let exclude = exclude.iter().map(|s| s.to_string()).collect_vec();
+
+        let (result_path, include, exclude) =
+            super::preprocess_paths_and_globs(&base_path, &include, &exclude).unwrap();
+
+        let expected = format!(
+            "{}{}",
+            ROOT,
+            base_path_exp.replace('/', std::path::MAIN_SEPARATOR_STR)
+        );
+        assert_eq!(result_path.to_string_lossy(), expected);
+
+        if let Some(include_exp) = include_exp {
+            assert_eq!(
+                include,
+                include_exp
+                    .iter()
+                    .map(|s| format!("{GLOB_ROOT}{s}"))
+                    .collect_vec()
+                    .as_slice()
+            );
+        }
+
+        if let Some(exclude_exp) = exclude_exp {
+            assert_eq!(
+                exclude,
+                exclude_exp
+                    .iter()
+                    .map(|s| format!("{GLOB_ROOT}{s}"))
+                    .collect_vec()
+                    .as_slice()
+            );
+        }
+    }
+
+    /// set up a globwalk test in a tempdir, returning the path to the tempdir
+    fn setup() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::with_prefix("globwalk").unwrap();
+
+        let directories = ["a/b/c", "a/c", "abc", "axbxcxdxe/xxx", "axbxcxdxexxx", "b"];
+
+        let files = [
+            "a/abc",
+            "a/b/c/d",
+            "a/c/b",
+            "abc/b",
+            "abcd",
+            "abcde",
+            "abxbbxdbxebxczzx",
+            "abxbbxdbxebxczzy",
+            "axbxcxdxe/f",
+            "axbxcxdxe/xxx/f",
+            "axbxcxdxexxx/f",
+            "axbxcxdxexxx/fff",
+            "a☺b",
+            "b/c",
+            "c",
+            "x",
+            "xxx",
+            "z",
+            "α",
+            "abc/【test】.txt",
+        ];
+
+        for dir in directories.iter() {
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+
+        for file in files.iter() {
+            std::fs::File::create(tmp.path().join(file)).unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            // these files/symlinks won't work on Windows
+            std::fs::File::create(tmp.path().join("-")).unwrap();
+            std::fs::File::create(tmp.path().join("]")).unwrap();
+
+            std::os::unix::fs::symlink("../axbxcxdxe/", tmp.path().join("b/symlink-dir")).unwrap();
+            std::os::unix::fs::symlink(
+                "/tmp/nonexistant-file-20160902155705",
+                tmp.path().join("broken-symlink"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("a/b", tmp.path().join("working-symlink")).unwrap();
+        }
+        tmp
+    }
+
+    #[test_case("a*/**", 22, 22 => matches None ; "wildcard followed by doublestar")]
+    #[test_case("**/*f", 4, 4 => matches None ; "leading doublestar expansion")]
+    #[test_case("**f", 4, 4 => matches None ; "transform leading doublestar")]
+    #[test_case("a**", 22, 22 => matches None ; "transform trailing doublestar")]
+    #[test_case("abc", 3, 3 => matches None ; "exact match")]
+    #[test_case("*", 19, 15 => matches None ; "single star match")]
+    #[test_case("*c", 2, 2 => matches None ; "single star suffix match")]
+    #[test_case("a*", 9, 9 => matches None ; "single star prefix match")]
+    #[test_case("a*/b", 2, 2 => matches None ; "single star prefix with suffix match")]
+    #[test_case("a*b*c*d*e*", 3, 3 => matches None ; "multiple single stars match")]
+    #[test_case("a*b*c*d*e*/f", 2, 2 => matches None ; "single star and double star match")]
+    #[test_case("a*b?c*x", 2, 2 => matches None ; "single star and question mark match")]
+    #[test_case("ab[c]", 1, 1 => matches None ; "character class match")]
+    #[test_case("ab[b-d]", 1, 1 => matches None ; "character class range match")]
+    #[test_case("ab[e-g]", 0, 0 => matches None ; "character class range mismatch")]
+    #[test_case("a?b", 1, 1 => matches None ; "question mark unicode match")]
+    #[test_case("a[!a]b", 1, 1 => matches None ; "negated character class unicode match 2")]
+    #[test_case("a???b", 0, 0 => matches None ; "insufficient question marks mismatch")]
+    #[test_case("a[^a][^a][^a]b", 0, 0 => matches None ; "multiple negated character classes mismatch")]
+    #[test_case("a?b", 1, 1 => matches None ; "question mark not matching slash")]
+    #[test_case("a*b", 1, 1 => matches None ; "single star not matching slash 2")]
+    #[test_case("[x-]", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "trailing dash in character class fail")]
+    #[test_case("[-x]", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "leading dash in character class fail")]
+    #[test_case("[a-b-d]", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "dash within character class range fail")]
+    #[test_case("[a-b-x]", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "dash within character class range fail 2")]
+    #[test_case("[", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "unclosed character class error")]
+    #[test_case("[^", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "unclosed negated character class error")]
+    #[test_case("[^bc", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "unclosed negated character class error 2")]
+    #[test_case("a[", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "unclosed character class error after pattern")]
+    #[test_case("ad[", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "unclosed character class error after pattern 2")]
+    #[test_case("*x", 4, 4 => matches None ; "star pattern match")]
+    #[test_case("[abc]", 3, 3 => matches None ; "single character class match")]
+    #[test_case("a/**", 7, 7 => matches None ; "a followed by double star match")]
+    #[test_case("**/c", 4, 4 => matches None ; "double star and single subdirectory match")]
+    #[test_case("a/**/b", 2, 2 => matches None ; "a followed by double star and single subdirectory match")]
+    #[test_case("a/**/c", 2, 2 => matches None ; "a followed by double star and multiple subdirectories match 2")]
+    #[test_case("a/**/d", 1, 1 => matches None ; "a followed by double star and multiple subdirectories with target match")]
+    #[test_case("a/b/c", 2, 2 => matches None ; "a followed by subdirectories and double slash mismatch")]
+    #[test_case("ab{c,d}", 1, 1 => matches None ; "pattern with curly braces match")]
+    #[test_case("ab{c,d,*}", 5, 5 => matches None ; "pattern with curly braces and wildcard match")]
+    #[test_case("ab{c,d}[", 0, 0 => matches Some(WalkError::BadPattern(_, _)))]
+    #[test_case("a{,bc}", 0, 0 => matches Some(WalkError::BadPattern(_, _)) ; "a followed by comma or b or c")]
+    #[test_case("a/{b/c,c/b}", 2, 2 => matches None)]
+    #[test_case("{a/{b,c},abc}", 3, 3 => matches None)]
+    #[test_case("{a/ab*}", 1, 1 => matches None)]
+    #[test_case("a/*", 3, 3 => matches None)]
+    #[test_case("{a/*}", 3, 3 => matches None ; "curly braces with single star match")]
+    #[test_case("{a/abc}", 1, 1 => matches None)]
+    #[test_case("{a/b,a/c}", 2, 2 => matches None)]
+    #[test_case("abc/**", 3, 3 => matches None ; "abc then doublestar")]
+    #[test_case("**/abc", 2, 2 => matches None)]
+    #[test_case("**/*.txt", 1, 1 => matches None)]
+    #[test_case("**/【*", 1, 1 => matches None ; "star with unicode")]
+    #[test_case("b/**/f", 0, 0 => matches None)]
+    fn glob_walk(
+        pattern: &str,
+        result_count: usize,
+        result_count_windows: usize,
+    ) -> Option<WalkError> {
+        glob_walk_inner(
+            pattern,
+            if cfg!(windows) {
+                result_count_windows
+            } else {
+                result_count
+            },
+        )
+    }
+
+    // these tests were configured to only run on unix, and not on windows
+    #[cfg(unix)]
+    // cannot use * as a path token on windows
+    #[test_case("a\\*b", 0 => matches None ; "escaped star mismatch")]
+    #[test_case("[\\]a]", 2 => matches None ; "escaped bracket match")]
+    #[test_case("[\\-]", 1  => matches None; "escaped dash match")]
+    #[test_case("[x\\-]", 2  => matches None; "escaped dash in character class match")]
+    #[test_case("[\\-x]", 2  => matches None; "escaped dash and character match")]
+    // #[test_case("[-]", Some(WalkError::BadPattern("[-]".into())), 0 ; "bare dash in character
+    // class match")] #[test_case("[x-]", Some(WalkError::BadPattern("[x-]".into())), 0 ;
+    // "trailing dash in character class match 2")] #[test_case("[-x]",
+    // Some(WalkError::BadPattern("[-x]".into())), 0 ; "leading dash in character class match 2")]
+    // #[test_case("[a-b-d]", Some(WalkError::BadPattern("[a-b-d]".into())), 0 ; "dash within
+    // character class range match 3")] #[test_case("\\",
+    // Some(WalkError::BadPattern("\\".into())), 0 ; "single backslash error")]
+    #[test_case("a/\\**", 0  => matches None; "a followed by escaped double star and subdirectories mismatch")]
+    #[test_case("a/\\[*\\]", 0  => matches None; "a followed by escaped character class and pattern mismatch")]
+    // in the go implementation, broken-symlink is yielded,
+    // however in symlink mode, walkdir yields broken symlinks as errors.
+    // Note that walkdir _always_ follows root symlinks. We handle this in the layer
+    // above wax.
+    #[test_case("broken-symlink", 1 => matches None ; "broken symlinks should be yielded")]
+    // globs that match across a symlink should not follow the symlink
+    #[test_case("working-symlink/c/*", 0 => matches None ; "working symlink should not be followed")]
+    #[test_case("working-sym*/*", 0 => matches None ; "working symlink should not be followed 2")]
+    fn glob_walk_unix(pattern: &str, result_count: usize) -> Option<WalkError> {
+        glob_walk_inner(pattern, result_count)
+    }
+
+    fn glob_walk_inner(pattern: &str, result_count: usize) -> Option<WalkError> {
+        let dir = setup();
+
+        let path = AbsoluteSystemPathBuf::try_from(dir.path()).unwrap();
+        let validated = ValidatedGlob::from_str(pattern).unwrap();
+        let success = match super::globwalk(&path, &[validated], &[], crate::WalkType::All) {
+            Ok(e) => e.into_iter(),
+            Err(e) => return Some(e),
+        };
+
+        assert_eq!(
+            success.len(),
+            result_count,
+            "{pattern}: expected {result_count} matches, but got {success:#?}"
+        );
+
+        None
+    }
+
+    #[test_case(
+        &["/test.txt"],
+        "/",
+        &["*.txt"],
+        &[],
+        &["/test.txt"],
+        &["/test.txt"],
+        Default::default()
+        ; "hello world"
+    )]
+    #[test_case(
+        &["/test.txt", "/subdir/test.txt", "/other/test.txt"],
+        "/",
+        &["subdir/test.txt", "test.txt"],
+        &[],
+        &["/subdir/test.txt", "/test.txt"],
+        &["/subdir/test.txt", "/test.txt"],
+        Default::default()
+        ; "bullet files"
+    )]
+    #[test_case(&[
+            "/external/file.txt",
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/bower_components/readline/package.json",
+            "/repos/some-app/examples/package.json",
+            "/repos/some-app/node_modules/gulp/bower_components/readline/package.json",
+            "/repos/some-app/node_modules/react/package.json",
+            "/repos/some-app/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/test/mocks/kitchen-sink/package.json",
+            "/repos/some-app/tests/mocks/kitchen-sink/package.json",
+        ],
+        "/repos/some-app/",
+        &["packages/*/package.json", "apps/*/package.json"], &["**/node_modules/", "**/bower_components/", "**/test/", "**/tests/"],
+        &[
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+        ],
+        &[
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+        ],
+        Default::default()
+        ; "finding workspace package.json files"
+    )]
+    #[test_case(&[
+            "/external/file.txt",
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/bower_components/readline/package.json",
+            "/repos/some-app/examples/package.json",
+            "/repos/some-app/node_modules/gulp/bower_components/readline/package.json",
+            "/repos/some-app/node_modules/react/package.json",
+            "/repos/some-app/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/test/mocks/spanish-inquisition/package.json",
+            "/repos/some-app/tests/mocks/spanish-inquisition/package.json",
+        ],
+        "/repos/some-app/",
+        &["**/package.json"],
+        &["**/node_modules/", "**/bower_components/", "**/test/", "**/tests/"],
+        &[
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/examples/package.json",
+            "/repos/some-app/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+        ],
+        &[
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/examples/package.json",
+            "/repos/some-app/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+        ],
+        Default::default()
+        ; "excludes unexpected workspace package.json files"
+    )]
+    #[test_case(&[
+            "/external/file.txt",
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/bower_components/readline/package.json",
+            "/repos/some-app/examples/package.json",
+            "/repos/some-app/node_modules/gulp/bower_components/readline/package.json",
+            "/repos/some-app/node_modules/react/package.json",
+            "/repos/some-app/package.json",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/node_modules/street-legal/package.json",
+            "/repos/some-app/packages/xzibit/node_modules/paint-colors/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/node_modules/meme/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/node_modules/yo-dawg/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/test/mocks/spanish-inquisition/package.json",
+            "/repos/some-app/tests/mocks/spanish-inquisition/package.json",
+        ],
+        "/repos/some-app/",
+        &["packages/**/package.json"],
+        &["**/node_modules/", "**/bower_components/", "**/test/", "**/tests/"],
+        &[
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/package.json",
+        ],
+        &[
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/package.json",
+        ],
+        Default::default()
+        ; "nested packages work")]
+    #[test_case(&[
+            "/external/file.txt",
+            "/repos/some-app/package.json",
+            "/repos/some-app/index.js",
+            "/repos/some-app/just-a-dir/index.js",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/index.js",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/colors/index.js",
+        ],
+        "/repos/some-app/",
+        &["**/*.js"],
+        &[],
+        &["/repos/some-app/index.js", "/repos/some-app/just-a-dir/index.js"],
+        &["/repos/some-app/index.js", "/repos/some-app/just-a-dir/index.js"],
+        Settings::default().ignore_nested_packages()
+        ; "ignore nested workspaces setting only matches top level package")]
+    #[test_case(&[
+            "/external/file.txt",
+            "/repos/some-app/apps/docs/package.json",
+            "/repos/some-app/apps/web/package.json",
+            "/repos/some-app/bower_components/readline/package.json",
+            "/repos/some-app/examples/package.json",
+            "/repos/some-app/node_modules/gulp/bower_components/readline/package.json",
+            "/repos/some-app/node_modules/react/package.json",
+            "/repos/some-app/package.json",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/node_modules/street-legal/package.json",
+            "/repos/some-app/packages/xzibit/node_modules/paint-colors/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/node_modules/meme/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/node_modules/yo-dawg/package.json",
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/test/mocks/spanish-inquisition/package.json",
+            "/repos/some-app/tests/mocks/spanish-inquisition/package.json",
+        ],
+        "/repos/some-app/",
+        &["packages/**/package.json", "tests/mocks/*/package.json"],
+        &["**/node_modules/", "**/bower_components/", "**/test/", "**/tests/"],
+        &[
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/package.json",
+        ],
+        &[
+            "/repos/some-app/packages/colors/package.json",
+            "/repos/some-app/packages/faker/package.json",
+            "/repos/some-app/packages/left-pad/package.json",
+            "/repos/some-app/packages/xzibit/package.json",
+            "/repos/some-app/packages/xzibit/packages/yo-dawg/package.json",
+        ],
+        Default::default()
+        ; "includes do not override excludes")]
+    #[test_case(&[
+            "/external/file.txt",
+            "/repos/some-app/src/index.js",
+            "/repos/some-app/public/src/css/index.css",
+            "/repos/some-app/.turbo/turbo-build.log",
+            "/repos/some-app/.turbo/somebody-touched-this-file-into-existence.txt",
+            "/repos/some-app/.next/log.txt",
+            "/repos/some-app/.next/cache/db6a76a62043520e7aaadd0bb2104e78.txt",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+            "/repos/some-app/public/dist/css/index.css",
+            "/repos/some-app/public/dist/images/rick_astley.jpg",
+        ],
+        "/repos/some-app/",
+        &[".turbo/turbo-build.log", "dist/**", ".next/**", "public/dist/**"],
+        &[],
+        &[
+            "/repos/some-app/.next",
+            "/repos/some-app/.next/cache",
+            "/repos/some-app/.next/cache/db6a76a62043520e7aaadd0bb2104e78.txt",
+            "/repos/some-app/.next/log.txt",
+            "/repos/some-app/.turbo/turbo-build.log",
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+            "/repos/some-app/public/dist",
+            "/repos/some-app/public/dist/css",
+            "/repos/some-app/public/dist/css/index.css",
+            "/repos/some-app/public/dist/images",
+            "/repos/some-app/public/dist/images/rick_astley.jpg",
+        ],
+        &[
+            "/repos/some-app/.next/cache/db6a76a62043520e7aaadd0bb2104e78.txt",
+            "/repos/some-app/.next/log.txt",
+            "/repos/some-app/.turbo/turbo-build.log",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+            "/repos/some-app/public/dist/css/index.css",
+            "/repos/some-app/public/dist/images/rick_astley.jpg",
+        ],
+        Default::default()
+        ; "output globbing grabs the desired content"
+    )]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ], "/repos/some-app/",
+        &["dist/**"],
+        &[],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        &[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        Default::default()
+        ; "passing ** captures all children")]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["dist"],
+        &[],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        &[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        Default::default()
+        ; "passing just a directory captures no children")]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ], "/repos/some-app/", &["**/*", "dist/**"], &[ ], &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ], &[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        Default::default()
+        ; "redundant includes do not duplicate"
+    )]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ], "/repos/some-app/", &["**"], &["**"], &[ ], &[ ], Default::default() ; "exclude everything, include everything")]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["dist/**"],
+        &["dist/js"],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+        ],
+        &[
+            "/repos/some-app/dist/index.html",
+        ],
+        Default::default()
+        ; "passing just a directory to exclude prevents capture of children")]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["dist/**"],
+        &["dist/js/**"],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            // "/repos/some-app/dist/js",
+        ],
+        &["/repos/some-app/dist/index.html",],
+        Default::default()
+        ; "passing ** to exclude prevents capture of children")]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["**"],
+        &["./"],
+        &[],
+        &[],
+        Default::default()
+        ; "exclude everything with folder . applies at base path"
+    )]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["**"],
+        &["./dist"],
+        &["repos/some-app"],
+        &[],
+        Default::default()
+        ; "exclude everything with traversal applies at a non-base path"
+    )]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["**"],
+        &["dist/../"],
+        &[],
+        &[],
+        Default::default()
+        ; "exclude everything with folder traversal (..) applies at base path"
+    )]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js"
+        ],
+        "/repos/some-app/",
+        &["dist/js/../**"],
+        &[],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js"],
+        &[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        Default::default()
+        ; "traversal works within base path"
+    )]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["dist/./././**"],
+        &[],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        &[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        Default::default()
+        ; "self references work (.)"
+    )]
+    #[test_case(&[
+            "/repos/some-app/package.json",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ], "/repos/some-app/", &["*"], &[ ], &[
+            "/repos/some-app/dist",
+            "/repos/some-app/package.json",
+        ], &["/repos/some-app/package.json"], Default::default() ; "depth of 1 includes handles folders properly")]
+    #[test_case(&[
+            "/repos/some-app/package.json",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["**"],
+        &["dist/*"],
+        &[
+            "/repos/some-app",
+            "/repos/some-app/dist",
+            "/repos/some-app/package.json",
+        ],
+        &["/repos/some-app/package.json"],
+        Default::default()
+        ; "depth of 1 excludes prevents capturing folders")]
+    #[test_case(&[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app",
+        &["dist/**"],
+        &[],
+        &[
+            "/repos/some-app/dist",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        &[
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        Default::default()
+        ; "No-trailing slash basePath works")]
+    #[test_case(&[
+            "/repos/some-app/included.txt",
+            "/repos/some-app/excluded.txt",
+        ], "/repos/some-app", &["*.txt"], &["excluded.txt"], &[
+            "/repos/some-app/included.txt",
+        ], &[
+            "/repos/some-app/included.txt",
+        ], Default::default() ; "exclude single file")]
+    #[test_case(&[
+            "/repos/some-app/one/included.txt",
+            "/repos/some-app/one/two/included.txt",
+            "/repos/some-app/one/two/three/included.txt",
+            "/repos/some-app/one/excluded.txt",
+            "/repos/some-app/one/two/excluded.txt",
+            "/repos/some-app/one/two/three/excluded.txt",
+        ],
+        "/repos/some-app",
+        &["**"],
+        &["**/excluded.txt"],
+        &[
+            "/repos/some-app/one/included.txt",
+            "/repos/some-app/one/two/included.txt",
+            "/repos/some-app/one/two/three/included.txt",
+            "/repos/some-app/one",
+            "/repos/some-app",
+            "/repos/some-app/one/two",
+            "/repos/some-app/one/two/three",
+        ], &[
+            "/repos/some-app/one/included.txt",
+            "/repos/some-app/one/two/included.txt",
+            "/repos/some-app/one/two/three/included.txt",
+        ], Default::default() ; "exclude nested single file")]
+    #[test_case(&[
+            "/repos/some-app/one/included.txt",
+            "/repos/some-app/one/two/included.txt",
+            "/repos/some-app/one/two/three/included.txt",
+            "/repos/some-app/one/excluded.txt",
+            "/repos/some-app/one/two/excluded.txt",
+            "/repos/some-app/one/two/three/excluded.txt",
+        ], "/repos/some-app", &["**"], &["**"], &[], &[], Default::default() ; "exclude everything")]
+    #[test_case(&[
+            "/repos/some-app/one/included.txt",
+            "/repos/some-app/one/two/included.txt",
+            "/repos/some-app/one/two/three/included.txt",
+            "/repos/some-app/one/excluded.txt",
+            "/repos/some-app/one/two/excluded.txt",
+            "/repos/some-app/one/two/three/excluded.txt",
+        ], "/repos/some-app", &["**"], &["**/"], &[], &[], Default::default() ; "exclude everything with slash")]
+    #[test_case(&[
+            "/repos/some-app/foo/bar",
+            "/repos/some-app/some-foo/bar",
+            "/repos/some-app/included",
+        ],
+        "/repos/some-app",
+        &["**"],
+        &["*foo"],
+        &[
+            "repos/some-app",
+            "/repos/some-app/included",
+        ],
+        &[
+            "/repos/some-app/included",
+        ],
+        Default::default()
+        ; "exclude everything with leading star"
+    )]
+    #[test_case(&[
+            "/repos/some-app/foo/bar",
+            "/repos/some-app/foo-file",
+            "/repos/some-app/foo-dir/bar",
+            "/repos/some-app/included",
+        ],
+        "/repos/some-app",
+        &["**"],
+        &["foo*"],
+        &[
+            "repos/some-app",
+            "/repos/some-app/included",
+        ],
+        &[
+            "/repos/some-app/included",
+        ],
+        Default::default()
+        ; "exclude everything with trailing star"
+    )]
+    fn glob_walk_files(
+        files: &[&str],
+        base_path: &str,
+        include: &[&str],
+        exclude: &[&str],
+        expected: &[&str],
+        expected_files: &[&str],
+        settings: Settings,
+    ) {
+        let dir = setup_files(files);
+        let base_path = base_path.trim_start_matches('/');
+        let path = AbsoluteSystemPathBuf::try_from(dir.path().join(base_path)).unwrap();
+        let include: Vec<_> = include
+            .iter()
+            .map(|s| ValidatedGlob::from_str(s).expect("valid inputs"))
+            .collect();
+        let exclude: Vec<_> = exclude
+            .iter()
+            .map(|s| ValidatedGlob::from_str(s).expect("valid inputs"))
+            .collect();
+
+        for (walk_type, expected) in [
+            (crate::WalkType::Files, expected_files),
+            (crate::WalkType::All, expected),
+        ] {
+            let success =
+                super::globwalk_with_settings(&path, &include, &exclude, walk_type, settings)
+                    .unwrap();
+
+            let success = success
+                .iter()
+                .map(|p| p.as_path().strip_prefix(dir.path()).unwrap().as_str())
+                .sorted()
+                .collect::<Vec<_>>();
+
+            let expected = expected
+                .iter()
+                .map(|p| {
+                    p.trim_start_matches('/')
+                        .replace('/', std::path::MAIN_SEPARATOR_STR)
+                })
+                .sorted()
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                success, expected,
+                "\n\n{walk_type:?}: expected \n{expected:#?} but got \n{success:#?}"
+            );
+        }
+    }
+
+    #[test_case(&[
+            "/repos/spanish-inquisition/index.html",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["../spanish-inquisition/**", "dist/**"],
+        &[],
+        &[],
+        &[]
+        ; "globs and traversal and globs do not cross base path"
+    )]
+    #[test_case(
+        &[
+            "/repos/spanish-inquisition/index.html",
+            "/repos/some-app/dist/index.html",
+            "/repos/some-app/dist/js/index.js",
+            "/repos/some-app/dist/js/lib.js",
+            "/repos/some-app/dist/js/node_modules/browserify.js",
+        ],
+        "/repos/some-app/",
+        &["**/../../spanish-inquisition/**"],
+        &[],
+        &[],
+        &[]
+        ; "globs and traversal and globs do not cross base path doublestart up"
+    )]
+    fn glob_walk_err(
+        files: &[&str],
+        _base_path: &str,
+        _include: &[&str],
+        _exclude: &[&str],
+        _expected: &[&str],
+        _expected_files: &[&str],
+    ) {
+        let _dir = setup_files(files);
+        // TODO: this test needs to be implemented...
+    }
+
+    fn setup_files(files: &[&str]) -> tempfile::TempDir {
+        setup_files_with_prefix("globwalk", files)
+    }
+
+    fn setup_files_with_prefix(prefix: &str, files: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::with_prefix(prefix).unwrap();
+        for file in files {
+            let file = file.trim_start_matches('/');
+            let path = tmp.path().join(file);
+            let parent = path.parent().unwrap();
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|_| panic!("failed to create {parent:?}"));
+            std::fs::File::create(path).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn test_directory_traversal() {
+        let files = &["root-file", "child/some-file"];
+        let tmp = setup_files(files);
+        let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+        let child = root.join_component("child");
+        let include = &[ValidatedGlob::from_str("../*-file").unwrap()];
+        let exclude = &[];
+        let iter = globwalk(&child, include, exclude, WalkType::Files)
+            .unwrap()
+            .into_iter();
+        let results = iter
+            .map(|entry| root.anchor(entry).unwrap().to_string())
+            .collect::<Vec<_>>();
+        let expected = vec!["root-file".to_string()];
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn workspace_globbing() {
+        let files = &[
+            "package.json",
+            "docs/package.json",
+            "apps/some-app/package.json",
+            "apps/ignored/package.json",
+            "node_modules/dep/package.json",
+            "apps/some-app/node_modules/dep/package.json",
+        ];
+        let tmp = setup_files(files);
+        let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+        let include = [
+            "apps/*/package.json",
+            "docs/package.json",
+            "empty/*/package.json",
+        ]
+        .into_iter()
+        .map(ValidatedGlob::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let exclude = ["apps/ignored", "**/node_modules/**"]
+            .into_iter()
+            .map(ValidatedGlob::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let iter = globwalk(&root, &include, &exclude, WalkType::Files).unwrap();
+        let paths = iter
+            .into_iter()
+            .map(|path| {
+                let relative = root.anchor(path).unwrap();
+                relative.to_string()
+            })
+            .collect::<HashSet<_>>();
+        let expected: HashSet<String> = HashSet::from_iter([
+            "docs/package.json"
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
+                .to_string(),
+            "apps/some-app/package.json"
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
+                .to_string(),
+        ]);
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn workspace_globbing_includes_dotfiles() {
+        // Wax's `*` matches dot-prefixed directories. The shallow wildcard
+        // fast path must preserve this behavior.
+        let files = &["apps/visible/package.json", "apps/.hidden/package.json"];
+        let tmp = setup_files(files);
+        let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+        let include = ["apps/*/package.json"]
+            .into_iter()
+            .map(ValidatedGlob::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let exclude: &[ValidatedGlob] = &[];
+        let iter = globwalk(&root, &include, exclude, WalkType::Files).unwrap();
+        let paths: HashSet<String> = iter
+            .into_iter()
+            .map(|path| root.anchor(path).unwrap().to_string())
+            .collect();
+        let expected: HashSet<String> = HashSet::from_iter([
+            "apps/visible/package.json"
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
+                .to_string(),
+            "apps/.hidden/package.json"
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
+                .to_string(),
+        ]);
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
+    #[cfg(not(windows))] // Windows doesn't support ':' at all, so just test not-Windows for correct
+    // behavior
+    fn test_weird_filenames() {
+        let files = &[
+            "apps/foo",
+            "apps/foo:bar",
+            "apps/foo::bar",
+            "apps/foo\\:bar",
+        ];
+        let tmp = setup_files(files);
+        let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+        let include = ["apps/*:bar"]
+            .into_iter()
+            .map(ValidatedGlob::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let exclude = &[];
+        let iter = globwalk(&root, &include, exclude, WalkType::Files).unwrap();
+        let paths = iter
+            .into_iter()
+            .map(|path| {
+                let relative = root.anchor(path).unwrap();
+                relative.to_string()
+            })
+            .collect::<HashSet<_>>();
+        let expected: HashSet<String> = HashSet::from_iter([
+            "apps/foo:bar".to_string(),
+            "apps/foo::bar".to_string(),
+            "apps/foo\\:bar".to_string(),
+        ]);
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn test_base_with_brackets() {
+        let files = &["foo", "bar", "baz"];
+        let tmp = setup_files_with_prefix("[path]", files);
+        let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+        let include = ["ba*"]
+            .into_iter()
+            .map(ValidatedGlob::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let exclude = &[];
+        let iter = globwalk(&root, &include, exclude, WalkType::Files).unwrap();
+        let paths = iter
+            .into_iter()
+            .map(|path| {
+                let relative = root.anchor(path).unwrap();
+                relative.to_string()
+            })
+            .collect::<HashSet<_>>();
+        let expected: HashSet<String> = HashSet::from_iter(["bar".to_string(), "baz".to_string()]);
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn test_escape_glob_literals() {
+        assert_eq!(
+            escape_glob_literals("?*$:<>()[]{},"),
+            r"\?\*\$\:\<\>\(\)\[\]\{\}\,"
+        );
+    }
+
+    #[test_case("**/*.ts", false ; "simple glob no cleaning")]
+    #[test_case("src/lib.rs", false ; "simple path no cleaning")]
+    #[test_case("a/b/c", false ; "multi segment no cleaning")]
+    #[test_case("./a/b", true ; "leading dot segment")]
+    #[test_case("a/./b", true ; "middle dot segment")]
+    #[test_case("a/b/.", true ; "trailing dot segment")]
+    #[test_case("../a/b", true ; "leading dotdot segment")]
+    #[test_case("a/../b", true ; "middle dotdot segment")]
+    #[test_case("a/b/..", true ; "trailing dotdot segment")]
+    #[test_case(".", true ; "just dot")]
+    #[test_case("..", true ; "just dotdot")]
+    #[test_case(".hidden", false ; "hidden file not a dot segment")]
+    #[test_case("a/.hidden/b", false ; "hidden dir not a dot segment")]
+    #[test_case("..hidden", false ; "dotdot prefix not a segment")]
+    #[test_case("a/..hidden", false ; "dotdot prefix in middle not a segment")]
+    #[test_case("a.b/c.d", false ; "dots in names not segments")]
+    #[test_case("a/b./c", false ; "trailing dot in name not a segment")]
+    #[test_case("a/b../c", false ; "trailing dotdot in name not a segment")]
+    fn test_needs_path_cleaning(input: &str, expected: bool) {
+        assert_eq!(
+            needs_path_cleaning(input),
+            expected,
+            "needs_path_cleaning({input:?}) should be {expected}"
+        );
+    }
+
+    #[test_case("foo", false, "foo" ; "file")]
+    #[test_case("foo", true, "foo/**" ; "dir")]
+    #[test_case("foo/", true, "foo/**" ; "dir slash")]
+    #[test_case("f[o0]o", true, "f[o0]o" ; "non-literal")]
+    fn test_add_double_star(glob: &str, is_dir: bool, expected: &str) {
+        let tmpdir = TempDir::with_prefix("doublestar").unwrap();
+        let base = AbsoluteSystemPath::new(tmpdir.path().to_str().unwrap()).unwrap();
+
+        let foo = base.join_component("foo");
+
+        match is_dir {
+            true => foo.create_dir_all().unwrap(),
+            false => foo.create_with_contents(b"bar").unwrap(),
+        }
+
+        let mut glob = glob.to_owned();
+
+        add_doublestar_to_dir(base, &mut glob);
+
+        assert_eq!(glob, expected);
+    }
+
+    // Regression tests for https://github.com/vercel/turborepo/issues/2517
+    // Workspace packages behind symlinked directories must be discoverable.
+    #[cfg(unix)]
+    mod symlink_discovery {
+        use std::{collections::HashSet, str::FromStr};
+
+        use turbopath::AbsoluteSystemPathBuf;
+
+        use crate::{Settings, ValidatedGlob, WalkType, globwalk, globwalk_with_settings};
+
+        fn setup_symlinked_workspace() -> tempfile::TempDir {
+            let tmp = tempfile::TempDir::with_prefix("symlink-discovery").unwrap();
+            let root = tmp.path();
+
+            // Real packages (not behind symlinks)
+            std::fs::create_dir_all(root.join("apps/web")).unwrap();
+            std::fs::File::create(root.join("apps/web/package.json")).unwrap();
+
+            // Package in an external location, symlinked into the workspace
+            std::fs::create_dir_all(root.join("external/widget-a")).unwrap();
+            std::fs::File::create(root.join("external/widget-a/package.json")).unwrap();
+
+            // Nested package behind symlink (for ** pattern testing)
+            std::fs::create_dir_all(root.join("external/nested/deep-pkg")).unwrap();
+            std::fs::File::create(root.join("external/nested/deep-pkg/package.json")).unwrap();
+
+            std::fs::create_dir_all(root.join("widgets")).unwrap();
+            std::os::unix::fs::symlink("../external/widget-a", root.join("widgets/widget-a"))
+                .unwrap();
+
+            std::fs::create_dir_all(root.join("packages")).unwrap();
+            std::os::unix::fs::symlink("../external/nested", root.join("packages/nested")).unwrap();
+
+            tmp
+        }
+
+        #[test]
+        fn shallow_wildcard_finds_symlinked_package() {
+            // Pattern: widgets/*/package.json (shallow wildcard optimization path)
+            let tmp = setup_symlinked_workspace();
+            let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+
+            let include = ["widgets/*/package.json"]
+                .into_iter()
+                .map(ValidatedGlob::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let exclude: &[ValidatedGlob] = &[];
+
+            let results = globwalk_with_settings(
+                &root,
+                &include,
+                exclude,
+                WalkType::Files,
+                Settings::default().follow_links(),
+            )
+            .unwrap();
+
+            let paths: HashSet<String> = results
+                .into_iter()
+                .map(|p| root.anchor(p).unwrap().to_string())
+                .collect();
+
+            let expected: HashSet<String> = HashSet::from_iter([
+                "widgets/widget-a/package.json".replace('/', std::path::MAIN_SEPARATOR_STR)
+            ]);
+            assert_eq!(paths, expected);
+        }
+
+        #[test]
+        fn doublestar_finds_symlinked_package() {
+            // Pattern: packages/**/package.json (general walk path with follow_links)
+            let tmp = setup_symlinked_workspace();
+            let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+
+            let include = ["packages/**/package.json"]
+                .into_iter()
+                .map(ValidatedGlob::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let exclude: &[ValidatedGlob] = &[];
+
+            let results = globwalk_with_settings(
+                &root,
+                &include,
+                exclude,
+                WalkType::Files,
+                Settings::default().follow_links(),
+            )
+            .unwrap();
+
+            let paths: HashSet<String> = results
+                .into_iter()
+                .map(|p| root.anchor(p).unwrap().to_string())
+                .collect();
+
+            assert!(
+                paths.contains(
+                    &"packages/nested/deep-pkg/package.json"
+                        .replace('/', std::path::MAIN_SEPARATOR_STR)
+                ),
+                "expected to find package.json behind symlinked dir via **, got: {paths:?}"
+            );
+        }
+
+        #[test]
+        fn doublestar_without_follow_links_misses_symlinked_package() {
+            // Confirms the default behavior: ** does NOT follow symlinks.
+            // This documents the pre-fix behavior for regression awareness.
+            let tmp = setup_symlinked_workspace();
+            let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+
+            let include = ["packages/**/package.json"]
+                .into_iter()
+                .map(ValidatedGlob::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let exclude: &[ValidatedGlob] = &[];
+
+            let results = globwalk(&root, &include, exclude, WalkType::Files).unwrap();
+
+            let paths: HashSet<String> = results
+                .into_iter()
+                .map(|p| root.anchor(p).unwrap().to_string())
+                .collect();
+
+            assert!(
+                !paths.contains(
+                    &"packages/nested/deep-pkg/package.json"
+                        .replace('/', std::path::MAIN_SEPARATOR_STR)
+                ),
+                "default globwalk should NOT follow symlinks into dirs, got: {paths:?}"
+            );
+        }
+
+        #[test]
+        fn mixed_real_and_symlinked_packages() {
+            // Both real and symlinked packages should be found together.
+            let tmp = setup_symlinked_workspace();
+            let root = AbsoluteSystemPathBuf::try_from(tmp.path()).unwrap();
+
+            let include = ["apps/*/package.json", "widgets/*/package.json"]
+                .into_iter()
+                .map(ValidatedGlob::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let exclude: &[ValidatedGlob] = &[];
+
+            let results = globwalk_with_settings(
+                &root,
+                &include,
+                exclude,
+                WalkType::Files,
+                Settings::default().follow_links(),
+            )
+            .unwrap();
+
+            let paths: HashSet<String> = results
+                .into_iter()
+                .map(|p| root.anchor(p).unwrap().to_string())
+                .collect();
+
+            let expected: HashSet<String> = HashSet::from_iter([
+                "apps/web/package.json".replace('/', std::path::MAIN_SEPARATOR_STR),
+                "widgets/widget-a/package.json".replace('/', std::path::MAIN_SEPARATOR_STR),
+            ]);
+            assert_eq!(paths, expected);
+        }
+
+        #[test]
+        fn broken_dir_symlink_does_not_crash() {
+            let tmp = tempfile::TempDir::with_prefix("broken-symlink").unwrap();
+            let root = tmp.path();
+
+            std::fs::create_dir_all(root.join("packages")).unwrap();
+            std::os::unix::fs::symlink("../nonexistent-dir", root.join("packages/broken-pkg"))
+                .unwrap();
+
+            let root = AbsoluteSystemPathBuf::try_from(root).unwrap();
+            let include = ["packages/*/package.json"]
+                .into_iter()
+                .map(ValidatedGlob::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let exclude: &[ValidatedGlob] = &[];
+
+            let results = globwalk_with_settings(
+                &root,
+                &include,
+                exclude,
+                WalkType::Files,
+                Settings::default().follow_links(),
+            )
+            .unwrap();
+
+            assert!(results.is_empty(), "broken symlink should yield no results");
+        }
+
+        #[test]
+        fn symlink_cycle_handled_gracefully() {
+            let tmp = tempfile::TempDir::with_prefix("cycle-symlink").unwrap();
+            let root = tmp.path();
+
+            std::fs::create_dir_all(root.join("packages/real-pkg")).unwrap();
+            std::fs::File::create(root.join("packages/real-pkg/package.json")).unwrap();
+
+            // Create a cycle: packages/loop -> packages
+            std::os::unix::fs::symlink("..", root.join("packages/loop")).unwrap();
+
+            let root = AbsoluteSystemPathBuf::try_from(root).unwrap();
+            let include = ["packages/**/package.json"]
+                .into_iter()
+                .map(ValidatedGlob::from_str)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let exclude: &[ValidatedGlob] = &[];
+
+            // Should not hang or panic. walkdir detects cycles.
+            let result = globwalk_with_settings(
+                &root,
+                &include,
+                exclude,
+                WalkType::Files,
+                Settings::default().follow_links(),
+            );
+
+            // Either succeeds with the real package or returns an error — neither
+            // is a hang or panic, which is the important part.
+            match result {
+                Ok(paths) => {
+                    let found: Vec<String> = paths
+                        .into_iter()
+                        .map(|p: AbsoluteSystemPathBuf| root.anchor(p).unwrap().to_string())
+                        .collect();
+                    assert!(
+                        found.contains(
+                            &"packages/real-pkg/package.json"
+                                .replace('/', std::path::MAIN_SEPARATOR_STR)
+                        ),
+                        "should still find the real package despite cycle, got: {found:?}"
+                    );
+                }
+                Err(_) => {
+                    // An error from the cycle is also acceptable behavior
+                }
+            }
+        }
+    }
+}

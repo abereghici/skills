@@ -1,0 +1,54 @@
+name: "Turbo Rust Setup"
+description: "Sets up the Rust toolchain for CI"
+inputs:
+  targets:
+    description: "Comma-separated list of target triples to install for this toolchain"
+    required: false
+  github-token:
+    description: "GitHub token. You can pass secrets.GITHUB_TOKEN"
+    required: true
+  shared-cache-key:
+    description: "A cache key that is used instead of the automatic `job`-based key, and is stable over multiple jobs."
+    required: false
+  cache-key:
+    description: "An additional cache key that is added alongside the automatic `job`-based cache key and can be used to further differentiate jobs."
+    required: false
+  save-cache:
+    description: "Determiners whether the cache should be saved. If `false`, the cache is only restored."
+    required: false
+    default: "false"
+  cache:
+    description: "Whether to enable the Rust cache. Set to `false` for jobs that don't compile."
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Setup Rust toolchain"
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        target: ${{ inputs.targets }}
+        # needed to not make it override the defaults
+        rustflags: ""
+        # we want more specific settings
+        cache: false
+
+    - name: Set Up Protoc
+      uses: ./.github/actions/setup-protoc
+      with:
+        version: "26.x"
+        github-token: ${{ inputs.github-token }}
+
+    - name: "Add cargo problem matchers"
+      shell: bash
+      run: echo "::add-matcher::${{ github.action_path }}/matchers.json"
+
+    - name: "Setup Rust Cache"
+      if: inputs.cache == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-cache-key }}
+        key: ${{ inputs.cache-key }}
+        # the cache is huge and we only get 10gb max, so we only save on master
+        save-if: ${{ github.ref == 'refs/heads/main' && inputs.save-cache || 'false' }}

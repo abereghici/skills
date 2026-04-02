@@ -1,0 +1,32 @@
+import type { ESLint } from "eslint";
+import { name, version } from "../package.json";
+import { RULES } from "./constants";
+import noUndeclaredEnvVars from "./rules/no-undeclared-env-vars";
+import recommended from "./configs/recommended";
+import flatRecommended from "./configs/flat/recommended";
+
+export type { RuleContextWithOptions } from "./rules/no-undeclared-env-vars";
+export type { ProjectKey } from "./utils/calculate-inputs";
+
+const plugin: ESLint.Plugin = {
+  meta: { name, version },
+  rules: {
+    [RULES.noUndeclaredEnvVars]: noUndeclaredEnvVars
+  },
+  configs: {
+    recommended,
+    "flat/recommended": {
+      ...flatRecommended,
+      plugins: {
+        get turbo(): ESLint.Plugin {
+          return plugin;
+        }
+      }
+    }
+  }
+};
+
+export const rules: ESLint.Plugin["rules"] = plugin.rules;
+export const configs: ESLint.Plugin["configs"] = plugin.configs;
+
+export default plugin;

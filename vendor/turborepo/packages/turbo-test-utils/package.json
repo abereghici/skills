@@ -1,0 +1,39 @@
+{
+  "name": "@turbo/test-utils",
+  "version": "0.0.0",
+  "private": true,
+  "description": "",
+  "keywords": [],
+  "homepage": "https://turborepo.dev",
+  "bugs": {
+    "url": "https://github.com/vercel/turborepo/issues"
+  },
+  "license": "MIT",
+  "author": "Vercel",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel/turborepo",
+    "directory": "packages/turbo-test-utils"
+  },
+  "main": "src/index.ts",
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "lint:prettier": "prettier -c . --cache --ignore-path=../../.prettier-ignore"
+  },
+  "dependencies": {
+    "fs-extra": "11.1.1",
+    "js-yaml": "4.1.1",
+    "json5": "2.2.3"
+  },
+  "devDependencies": {
+    "@jest/globals": "30.2.0",
+    "@turbo/tsconfig": "workspace:*",
+    "@types/fs-extra": "9.0.13",
+    "@types/js-yaml": "4.0.5",
+    "@types/node": "18.17.4",
+    "jest": "30.2.0",
+    "jest-mock": "30.2.0",
+    "ts-jest": "29.4.6",
+    "typescript": "5.5.4"
+  }
+}
