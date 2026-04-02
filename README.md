@@ -1,4 +1,4 @@
-# Alxandru Bereghici's Skills
+# Alexandru Bereghici's Skills
 
 A curated collection of [Agent Skills](https://agentskills.io/home) reflecting [Alexandru Bereghici](https://github.com/abereghici)'s preferences, experience, and best practices, along with usage documentation for the tools.
 
