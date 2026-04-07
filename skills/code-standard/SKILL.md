@@ -1,6 +1,6 @@
 ---
 name: code-standard
-description: Pragmatic coding standards — concise, direct, no over-engineering, no unnecessary comments. ALWAYS apply this skill for any coding task: writing code, fixing bugs, refactoring, reviewing, or any software engineering work. Never skip these standards regardless of language, framework, or task size.
+description: "Pragmatic coding standards — concise, direct, no over-engineering, no unnecessary comments. ALWAYS apply this skill for any coding task: writing code, fixing bugs, refactoring, reviewing, or any software engineering work. Never skip these standards regardless of language, framework, or task size."
 allowed-tools:
   - Read
   - Write
