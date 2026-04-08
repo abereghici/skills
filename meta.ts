@@ -52,6 +52,12 @@ export const vendors: Record<string, VendorSkillMeta> = {
       tdd: "tdd",
     },
   },
+  "tanstack-agent-skills": {
+    source: "https://github.com/DeckardGer/tanstack-agent-skills",
+    skills: {
+      "skills/tanstack-query": "tanstack-query",
+    },
+  },
 };
 
 /**
