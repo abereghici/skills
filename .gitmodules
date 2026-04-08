@@ -22,3 +22,6 @@
 [submodule "vendor/mattpocock-skills"]
 	path = vendor/mattpocock-skills
 	url = https://github.com/mattpocock/skills
+[submodule "vendor/tanstack-agent-skills"]
+	path = vendor/tanstack-agent-skills
+	url = https://github.com/DeckardGer/tanstack-agent-skills
