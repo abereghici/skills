@@ -53,11 +53,13 @@ Synced from external repositories that maintain their own skills.
 
 | Skill                                                               | Description                                                              | Source                                                                  |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| [turborepo](skills/turborepo) (Official)                            | Turborepo - high-performance build system for monorepos                  | [vercel/turborepo](https://github.com/vercel/turborepo)                 |
-| [web-design-guidelines](skills/web-design-guidelines)               | Web design guidelines for building beautiful interfaces                  | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) |
-| [react-best-practices](skills/react-best-practices)                 | React and Next.js performance optimization guidelines from Vercel        | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills) |
-| [tanstack-router](skills/tanstack-router) (Official)                | TanStack Router - framework-agnostic type-safe routing core              | [TanStack/router](https://github.com/TanStack/router)                   |
-| [tanstack-react-router](skills/tanstack-react-router) (Official)    | TanStack Router - React bindings for type-safe client-side routing       | [TanStack/router](https://github.com/TanStack/router)                   |
+| [turborepo](skills/turborepo) (Official)                            | Turborepo - high-performance build system for monorepos                  | [vercel/turborepo](https://github.com/vercel/turborepo)                           |
+| [web-design-guidelines](skills/web-design-guidelines)               | Web design guidelines for building beautiful interfaces                  | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills)           |
+| [react-best-practices](skills/react-best-practices)                 | React and Next.js performance optimization guidelines from Vercel        | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills)           |
+| [tanstack-router](skills/tanstack-router) (Official)                | TanStack Router - framework-agnostic type-safe routing core              | [TanStack/router](https://github.com/TanStack/router)                             |
+| [tanstack-react-router](skills/tanstack-react-router) (Official)    | TanStack Router - React bindings for type-safe client-side routing       | [TanStack/router](https://github.com/TanStack/router)                             |
+| [tanstack-query](skills/tanstack-query)                             | TanStack Query - async state management, caching, and data fetching      | [DeckardGer/tanstack-agent-skills](https://github.com/DeckardGer/tanstack-agent-skills) |
+| [tdd](skills/tdd)                                                   | Test-driven development with red-green-refactor loop                     | [mattpocock/skills](https://github.com/mattpocock/skills)                         |
 
 ## FAQ
 
