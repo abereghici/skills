@@ -41,11 +41,12 @@ Manually maintained by Alexandru Bereghici with his preferred tools, setup conve
 
 Generated from official documentation.
 
-| Skill                   | Description                                          | Source                                                    |
-| ----------------------- | ---------------------------------------------------- | --------------------------------------------------------- |
-| [vite](skills/vite)     | Vite build tool - config, plugins, SSR, library mode | [vitejs/vite](https://github.com/vitejs/vite)             |
-| [vitest](skills/vitest) | Vitest - unit testing framework powered by Vite      | [vitest-dev/vitest](https://github.com/vitest-dev/vitest) |
-| [pnpm](skills/pnpm)     | pnpm - fast, disk space efficient package manager    | [pnpm/pnpm.io](https://github.com/pnpm/pnpm.io)           |
+| Skill                                         | Description                                          | Source                                                    |
+| --------------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------- |
+| [vite](skills/vite)                           | Vite build tool - config, plugins, SSR, library mode | [vitejs/vite](https://github.com/vitejs/vite)             |
+| [vitest](skills/vitest)                       | Vitest - unit testing framework powered by Vite      | [vitest-dev/vitest](https://github.com/vitest-dev/vitest) |
+| [pnpm](skills/pnpm)                           | pnpm - fast, disk space efficient package manager    | [pnpm/pnpm.io](https://github.com/pnpm/pnpm.io)           |
+| [tanstack-table](skills/tanstack-table)       | TanStack Table v8/v9 - headless data grid, sorting, filtering, pagination, and more | [TanStack/table](https://github.com/TanStack/table) |
 
 ### Vendored Skills
 

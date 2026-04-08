@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "skill-creator": {
+      "source": "abereghici/skills",
+      "sourceType": "github",
+      "computedHash": "6a786b61bc6895b1ef964104350467f40b4d2492adc9f605f4d28f5fcf5ecef2"
+    }
+  }
+}

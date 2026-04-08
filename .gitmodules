@@ -25,3 +25,7 @@
 [submodule "vendor/tanstack-agent-skills"]
 	path = vendor/tanstack-agent-skills
 	url = https://github.com/DeckardGer/tanstack-agent-skills
+[submodule "sources/tanstack-table"]
+	path = sources/tanstack-table
+	url = https://github.com/TanStack/table
+	branch = alpha

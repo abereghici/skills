@@ -11,6 +11,7 @@ export const submodules = {
   vite: "https://github.com/vitejs/vite",
   pnpm: "https://github.com/pnpm/pnpm.io",
   vitest: "https://github.com/vitest-dev/vitest",
+  "tanstack-table": "https://github.com/TanStack/table",
 };
 
 /**
