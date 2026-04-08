@@ -16,3 +16,9 @@
 [submodule "vendor/tanstack-router"]
 	path = vendor/tanstack-router
 	url = https://github.com/TanStack/router
+[submodule "vendor/skill-creator"]
+	path = vendor/skill-creator
+	url = https://github.com/anthropics/skills
+[submodule "vendor/mattpocock-skills"]
+	path = vendor/mattpocock-skills
+	url = https://github.com/mattpocock/skills

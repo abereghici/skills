@@ -46,6 +46,12 @@ export const vendors: Record<string, VendorSkillMeta> = {
       "packages/react-router/skills/react-router": "tanstack-react-router",
     },
   },
+  "mattpocock-skills": {
+    source: "https://github.com/mattpocock/skills",
+    skills: {
+      tdd: "tdd",
+    },
+  },
 };
 
 /**
