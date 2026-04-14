@@ -41,32 +41,32 @@ Manually maintained by Alexandru Bereghici with his preferred tools, setup conve
 
 Generated from official documentation.
 
-| Skill                                         | Description                                          | Source                                                    |
-| --------------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------- |
-| [vite](skills/vite)                           | Vite build tool - config, plugins, SSR, library mode | [vitejs/vite](https://github.com/vitejs/vite)             |
-| [vitest](skills/vitest)                       | Vitest - unit testing framework powered by Vite      | [vitest-dev/vitest](https://github.com/vitest-dev/vitest) |
-| [pnpm](skills/pnpm)                           | pnpm - fast, disk space efficient package manager    | [pnpm/pnpm.io](https://github.com/pnpm/pnpm.io)           |
-| [tanstack-table](skills/tanstack-table)       | TanStack Table v8/v9 - headless data grid, sorting, filtering, pagination, and more | [TanStack/table](https://github.com/TanStack/table) |
+| Skill                                   | Description                                                                         | Source                                                    |
+| --------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| [vite](skills/vite)                     | Vite build tool - config, plugins, SSR, library mode                                | [vitejs/vite](https://github.com/vitejs/vite)             |
+| [vitest](skills/vitest)                 | Vitest - unit testing framework powered by Vite                                     | [vitest-dev/vitest](https://github.com/vitest-dev/vitest) |
+| [pnpm](skills/pnpm)                     | pnpm - fast, disk space efficient package manager                                   | [pnpm/pnpm.io](https://github.com/pnpm/pnpm.io)           |
+| [tanstack-table](skills/tanstack-table) | TanStack Table v8/v9 - headless data grid, sorting, filtering, pagination, and more | [TanStack/table](https://github.com/TanStack/table)       |
 
 ### Vendored Skills
 
 Synced from external repositories that maintain their own skills.
 
-| Skill                                                               | Description                                                              | Source                                                                  |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| [turborepo](skills/turborepo) (Official)                            | Turborepo - high-performance build system for monorepos                  | [vercel/turborepo](https://github.com/vercel/turborepo)                           |
-| [web-design-guidelines](skills/web-design-guidelines)               | Web design guidelines for building beautiful interfaces                  | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills)           |
-| [react-best-practices](skills/react-best-practices)                 | React and Next.js performance optimization guidelines from Vercel        | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills)           |
-| [tanstack-router](skills/tanstack-router) (Official)                | TanStack Router - framework-agnostic type-safe routing core              | [TanStack/router](https://github.com/TanStack/router)                             |
-| [tanstack-react-router](skills/tanstack-react-router) (Official)    | TanStack Router - React bindings for type-safe client-side routing       | [TanStack/router](https://github.com/TanStack/router)                             |
-| [tanstack-query](skills/tanstack-query)                             | TanStack Query - async state management, caching, and data fetching      | [DeckardGer/tanstack-agent-skills](https://github.com/DeckardGer/tanstack-agent-skills) |
-| [tdd](skills/tdd)                                                   | Test-driven development with red-green-refactor loop                     | [mattpocock/skills](https://github.com/mattpocock/skills)                         |
+| Skill                                                            | Description                                                         | Source                                                                                  |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| [turborepo](skills/turborepo) (Official)                         | Turborepo - high-performance build system for monorepos             | [vercel/turborepo](https://github.com/vercel/turborepo)                                 |
+| [web-design-guidelines](skills/web-design-guidelines)            | Web design guidelines for building beautiful interfaces             | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills)                 |
+| [react-best-practices](skills/react-best-practices)              | React and Next.js performance optimization guidelines from Vercel   | [vercel-labs/agent-skills](https://github.com/vercel-labs/agent-skills)                 |
+| [tanstack-router](skills/tanstack-router) (Official)             | TanStack Router - framework-agnostic type-safe routing core         | [TanStack/router](https://github.com/TanStack/router)                                   |
+| [tanstack-react-router](skills/tanstack-react-router) (Official) | TanStack Router - React bindings for type-safe client-side routing  | [TanStack/router](https://github.com/TanStack/router)                                   |
+| [tanstack-query](skills/tanstack-query)                          | TanStack Query - async state management, caching, and data fetching | [DeckardGer/tanstack-agent-skills](https://github.com/DeckardGer/tanstack-agent-skills) |
+| [tdd](skills/tdd)                                                | Test-driven development with red-green-refactor loop                | [mattpocock/skills](https://github.com/mattpocock/skills)                               |
 
 ## FAQ
 
 ### What Makes This Collection Different?
 
-This collection is opinionated, but the key difference is that it uses git submodules to directly reference source documentation. This provides more reliable context and allows the skills to stay up-to-date with upstream changes over time. If you primarily work with Vue/Vite/Nuxt, this aims to be a comprehensive one-stop collection.
+This collection is opinionated, but the key difference is that it uses git submodules to directly reference source documentation. This provides more reliable context and allows the skills to stay up-to-date with upstream changes over time. If you primarily work with Vite/React/Next, this aims to be a comprehensive one-stop collection.
 
 The project is also designed to be flexible - you can use it as a template to generate your own skills collection.
 
