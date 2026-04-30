@@ -50,7 +50,7 @@ export const vendors: Record<string, VendorSkillMeta> = {
   "mattpocock-skills": {
     source: "https://github.com/mattpocock/skills",
     skills: {
-      tdd: "tdd",
+      "skills/engineering/tdd": "tdd",
     },
   },
   "tanstack-agent-skills": {

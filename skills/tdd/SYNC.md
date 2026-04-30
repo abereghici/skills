@@ -1,5 +1,5 @@
 # Sync Info
 
-- **Source:** `vendor/mattpocock-skills/tdd`
-- **Git SHA:** `651eab033bdf8f7fd535c274f8cbe839075aba5e`
-- **Synced:** 2026-04-08
+- **Source:** `vendor/mattpocock-skills/skills/engineering/tdd`
+- **Git SHA:** `b843cb5ea74b1fe5e58a0fc23cddef9e66076fb8`
+- **Synced:** 2026-04-30
